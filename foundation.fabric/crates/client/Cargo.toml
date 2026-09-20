@@ -1,0 +1,13 @@
+[package]
+name = "fabric-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fabric-app-broker = { path = "../app-broker" }
+tokio.workspace = true

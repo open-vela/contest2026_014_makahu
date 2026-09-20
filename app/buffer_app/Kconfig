@@ -1,0 +1,80 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
+	bool "Contest 2026 team 014 Buffer Vela app"
+	default n
+	depends on GRAPHICS_LVGL
+	depends on LV_USE_NUTTX
+	depends on AUDIO
+	depends on INPUT_BUTTONS
+	depends on NET
+	depends on NETUTILS_CJSON
+	depends on NETUTILS_NETINIT
+	depends on NETUTILS_DHCPC
+	depends on CRYPTO_MBEDTLS
+	select AUDIOUTILS_ALSA_LIB
+	---help---
+		Enable the Buffer capture, offline queue, LAN bridge and card shelf
+		for the Gemini-S1 Vela device.
+
+if LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
+
+config BUFFER_VELA_BLE
+	bool "Buffer BLE enrollment discovery"
+	default y
+	depends on BLUETOOTH_FRAMEWORK
+	depends on BLUETOOTH_BLE_ADV
+	depends on BLUETOOTH_GATT_SERVER
+	depends on BT_SMP
+
+config BUFFER_VELA_DATA_DIR
+	string "Buffer Vela data directory"
+	default "/data/buffer"
+
+config BUFFER_VELA_PHONE_HOST
+	string "Default Buffer phone address"
+	default "192.168.1.100"
+
+config BUFFER_VELA_PHONE_PORT
+	int "Buffer phone TCP port"
+	default 48888
+	range 1024 65535
+
+config BUFFER_VELA_WIFI_IFNAME
+	string "Buffer Vela Wi-Fi interface"
+	default "wlan0"
+
+config BUFFER_VELA_DISCOVERY_PORT
+	int "Buffer Vela UDP discovery port"
+	default 48886
+	range 1024 65535
+
+config BUFFER_VELA_PAIRING_PORT
+	int "Buffer Vela TCP pairing port"
+	default 48887
+	range 1024 65535
+
+config BUFFER_VELA_MAX_RECORD_MS
+	int "Maximum press-to-talk recording length (ms)"
+	default 8000
+	range 1000 30000
+
+config BUFFER_VELA_MAX_CAPTURE_BYTES
+	int "Maximum queued audio size (bytes)"
+	default 524288
+	range 16384 2097152
+
+config BUFFER_VELA_QUEUE_LIMIT
+	int "Maximum number of offline captures"
+	default 8
+	range 1 64
+
+config BUFFER_VELA_FOCUS_REMINDER_MS
+	int "Focus care reminder interval (ms)"
+	default 3000000
+	range 60000 86400000
+
+endif

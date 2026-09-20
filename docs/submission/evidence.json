@@ -1,0 +1,190 @@
+{
+  "date": "2026-09-20",
+  "baseline": "Pre data/domain/ui refactor; MiMo integration /tmp/buffer-mimo-agent-build2.log",
+  "android": {
+    "tests": 257,
+    "failures": 0,
+    "errors": 0
+  },
+  "junit_sources": [
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.ClassificationDatabaseTest.xml",
+      "sha256": "0519ae9f96a15dcf8910997e30a75b708702f5ebca63c1f72ccfc6f8f5fbfb5c"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.WeeklySummaryTest.xml",
+      "sha256": "850cdd17b49e5f08d79815226c922dfeadab5281b75b133ee35410944ee3f5bd"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.RepositoryTransactionTest.xml",
+      "sha256": "85ab5ad859053ca5bef939d9b58cd7a9b3791e47b341ca11ea1ba9582cf87814"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.RabbitHoleSessionTest.xml",
+      "sha256": "ab5e6d3e88c56ea482740a703924631b79a2b44da271153e1439fea555facac0"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.ClassificationHttpTest.xml",
+      "sha256": "27cf8489a174d66026b730106429db4efe6361128480eac01817aafe8afb9bed"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.EnrollmentAuthenticationTest.xml",
+      "sha256": "87d4b80e82e54959e1199f888d2c30409f60c83dd4cb7cf81a75d7909e7ded2b"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaGattEnrollmentTest.xml",
+      "sha256": "1d3c17f86bcea21c5fd3d4380548516504124c7b21bb088d97a36ce56765495f"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.HealthSyncRecoveryTest.xml",
+      "sha256": "6846b38b0f417577870de9c0abdd61dea5b7e845fd517822c2a1241cc11353fb"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.MiMoProcessingTest.xml",
+      "sha256": "20346465ee6ede8f69388d86b0fbe5f2113ef5e232cfbce51057683b292e61d9"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaEnrollmentStoreTest.xml",
+      "sha256": "d081ce88bb8dd9ff6b133c9d6ff7d2834475c987a3653beac3917acce08deeb6"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.LifeLogCategoriesTest.xml",
+      "sha256": "0eca5493e700d601808f9fdc5c0b47679783d6d816e9eb7018df2e6035243a00"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaEnrollmentRecoveryUiTest.xml",
+      "sha256": "9b953bc05e767d6d4afd025c35838391bf9a3355ddbf6a6dad391491bc69e401"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.AnswerDatabaseTest.xml",
+      "sha256": "778e9f66b90ad397864e6319237cb819c725b6ceca95aba2e9b30e7a20a09607"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.WeeklyScheduleTest.xml",
+      "sha256": "98de9d8641943fd5d578e8f069fc73e3590e3930ff27c56a41a6085374279766"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.RabbitHoleNotificationTest.xml",
+      "sha256": "640883b1fbd7c526caad9a974dca456c136b6557d4fee41b264e24e664dfb59b"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.ClassificationLeaseTest.xml",
+      "sha256": "e01da5b506343ccdc510ff4d78a2c72184b4e455ce561f80253c624bceaf0f61"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.ClassificationReviewTest.xml",
+      "sha256": "db222fb646e25328b194b2f7eb2943708894457544ba0a91e9aeb542248f06fd"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CardReminderNavigationTest.xml",
+      "sha256": "113dc2fdff22438d3b25ed0c01a875b2c5e4f4fbf663ca35603c314ea4a2ab65"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.AnswerHttpTest.xml",
+      "sha256": "8cf32fb1647871a3019dc4b29162f48e67ba503c553d86390726f7aaf0ee12cb"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CardReturnTest.xml",
+      "sha256": "7c4f3b01dc4f04d9b31cc98b862d2ad02e5b3bb98e30d026fc1ca594660914d4"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.WireActionTest.xml",
+      "sha256": "6789ee9ce31b0f6551d0dc1c4a94c9c19551009d5dfd95f80507e0fb7989bb5a"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CalendarWriteSelectionTest.xml",
+      "sha256": "f49fc7fd8dbc891b7c66fc1d3cb88f730f8bfe5625843d52586c704913ac70b5"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaBleDiscoveryTest.xml",
+      "sha256": "a108b298e42878ef0e16699ab7b1c2433a55d2323ae0ed92d83a6e5bbc97f0bc"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.BoundedLineReaderTest.xml",
+      "sha256": "ceffc329e20628a5b7f5a01fdabbc5d33d32a812ae91b612aef7878ac90737e6"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaEnrollmentResultTest.xml",
+      "sha256": "00d1319167e0571be9368fe55b20a85c40144efcfa2a6cabfcc89714125e5a6e"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaBridgeServerTest.xml",
+      "sha256": "55416c32e3afe5cf5fe7e7adba565c611fd071bc5a30aed44a060284ed7020fc"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.RecordingFinalizerTest.xml",
+      "sha256": "20906540856b3d10649a120fd20eb96ae1541784dc0fe091edce1f2e395b598d"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.VelaEnrollmentProtocolTest.xml",
+      "sha256": "458855a8e276678cedde5a89b991d5f5730a791a8f1e84f72c8da76cbef0fe52"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.BedtimePlannerTest.xml",
+      "sha256": "deb9f0dac4d3af9f5192972e99b9f0157f5ab1dad553036713a398180c453c3e"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.BedtimeDeckTest.xml",
+      "sha256": "2a13782288d97176cc0dd724ab0b68584f8ad4d3cc382e488ad480bb2513f524"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CalendarRecoveryTest.xml",
+      "sha256": "cc61be5bb89d2251aa88ad66b50aa70a0d41ff3ef6881768345af74356a8f2b3"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.AudioCaptureDatabaseTest.xml",
+      "sha256": "895eed56ad2916944922884d298cdf3a385184ff7fcbae8391914e94e07bc6ef"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CalendarReceiptsTest.xml",
+      "sha256": "c108a2e021dac5507ceefac702673e37170a531150f52073ded8f4dd89749f53"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.TranscriptionDatabaseTest.xml",
+      "sha256": "e496616cc32a2b78ad7be769a3b4cd09fb84f8110efe61eff364de8b396d696a"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.BedtimeDatabaseTest.xml",
+      "sha256": "f54078658082beed6b06f78ffba833c086696a7eddf3707ff82dc28cebc43df2"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.PhoneAuthenticationTest.xml",
+      "sha256": "dcb256e987cd2861660ebd895565add1d52d0cd6ab5766b1735251d7fe878167"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.FocusReminderConfigTest.xml",
+      "sha256": "6f70e3367a74ec0640565769fc28b079a6b7ea56b5e8e3f715a71dd7c1893451"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.ModeTransactionTest.xml",
+      "sha256": "452c7de5804dd44a6a8357b96098e7d339bd6ca2e7328f8cf1c9ca49bfa8a75e"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.OpenAiCompatibleTest.xml",
+      "sha256": "8b96c83eb612b624a732eb478e693d74da0b7dade984c9a7b3544d39c10fb3ce"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CardActionDatabaseTest.xml",
+      "sha256": "0f2ed189bd2fa2e7cdcaf71e51b77f32c002921557d37ffbafc7a904f0fcfaa4"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CareSchedulerDatabaseTest.xml",
+      "sha256": "6a6d4ce18f017b7c5b9b3051828d0df9db417b0847c4d3b982119a2df4952691"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CollectionEditingTest.xml",
+      "sha256": "ae0c504c92c59ce7efb4ed6e64e6046510651220ff1df3c9d766e3823d2af43c"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.WeeklyLlmQueueTest.xml",
+      "sha256": "fc55a60be22159c584cdf097cff3de2370eec5937d64550293a6cf59a71016b5"
+    },
+    {
+      "name": "TEST-com.mocharealm.foundation.fabric.buffer.CardReminderTest.xml",
+      "sha256": "1af3faeb21936ba3617c683094ff7e616435815d5bc96efe2c8fd9457e8a3eca"
+    }
+  ],
+  "vela_host_scripts_passed": 16,
+  "real_mimo_accuracy_measured": false,
+  "end_to_end_dual_emulator_verified": false
+}

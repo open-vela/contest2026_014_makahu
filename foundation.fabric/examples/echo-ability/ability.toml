@@ -1,0 +1,23 @@
+namespace = "com.example"
+name = "echo"
+major = 1
+protocol_hash_algorithm = "sha256"
+
+[[roles]]
+id = "peer"
+min_instances = 1
+max_instances = 16
+
+[[roles.ports]]
+id = "messages"
+direction = "bidirectional"
+mode = "reliable_messages"
+schema = "schemas/control.proto#Echo"
+required = true
+
+[requirements]
+clock = "none"
+barrier = false
+minimum_device_trust = "trusted"
+remote_app_auth = "hub_attested"
+payload_security = "link_encrypted"

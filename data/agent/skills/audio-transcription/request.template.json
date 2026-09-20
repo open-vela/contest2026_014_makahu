@@ -1,0 +1,20 @@
+{
+  "model": "mimo-v2.5-asr",
+  "stream": false,
+  "asr_options": {
+    "language": "auto"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_audio",
+          "input_audio": {
+            "data": "data:audio/wav;base64,${WAV_BASE64}"
+          }
+        }
+      ]
+    }
+  ]
+}

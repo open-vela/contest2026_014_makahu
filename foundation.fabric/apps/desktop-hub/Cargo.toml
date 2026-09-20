@@ -1,0 +1,22 @@
+[package]
+name = "fabric-desktop-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+eframe.workspace = true
+fabric-app-broker = { path = "../../crates/app-broker" }
+fabric-core.workspace = true
+fabric-discovery.workspace = true
+fabric-hub = { path = "../../crates/hub", features = ["ble"] }
+fabric-identity.workspace = true
+fabric-link.workspace = true
+fabric-protocol.workspace = true
+tokio.workspace = true

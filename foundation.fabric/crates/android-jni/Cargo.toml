@@ -1,0 +1,37 @@
+[package]
+name = "fabric-android-jni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[dependencies]
+bytes.workspace = true
+fabric-app-broker = { path = "../app-broker" }
+fabric-core.workspace = true
+fabric-discovery.workspace = true
+fabric-discovery-ble.workspace = true
+fabric-discovery-wifi-aware.workspace = true
+fabric-hub = { path = "../hub", default-features = false, features = ["quic", "mdns", "ble", "wifi-aware", "clock"] }
+fabric-identity.workspace = true
+fabric-ipc.workspace = true
+fabric-link.workspace = true
+fabric-protocol.workspace = true
+fabric-transport-quic.workspace = true
+jni = "0.21.1"
+libc = "0.2"
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true

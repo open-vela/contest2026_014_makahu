@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "invocation": "disabled",
+  "skills": [
+    {
+      "id": "capture-organizer",
+      "path": "skills/capture-organizer/SKILL.md",
+      "enabled": false
+    },
+    {
+      "id": "question-answer",
+      "path": "skills/question-answer/SKILL.md",
+      "enabled": false
+    },
+    {
+      "id": "weekly-review",
+      "path": "skills/weekly-review/SKILL.md",
+      "enabled": false
+    },
+    {
+      "id": "audio-transcription",
+      "path": "skills/audio-transcription/SKILL.md",
+      "enabled": false
+    }
+  ]
+}

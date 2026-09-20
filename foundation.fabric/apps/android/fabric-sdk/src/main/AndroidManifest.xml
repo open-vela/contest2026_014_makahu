@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Binding the hub service requires this permission and (on Android 11+)
+         package visibility of the hub app. Consumers inherit both from the SDK. -->
+    <uses-permission android:name="com.mocharealm.foundation.fabric.permission.CONNECT_HUB" />
+
+    <queries>
+        <package android:name="com.mocharealm.foundation.fabric" />
+    </queries>
+
+</manifest>

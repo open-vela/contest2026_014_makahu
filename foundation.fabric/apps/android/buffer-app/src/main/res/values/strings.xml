@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Buffer</string>
+    <string name="capture_widget_title">Buffer · 记下此刻</string>
+    <string name="capture_widget_description">快速记录文字或打开语音捕获</string>
+    <string name="capture_text">记文字</string>
+    <string name="capture_voice">录语音</string>
+</resources>

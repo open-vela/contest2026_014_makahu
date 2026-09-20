@@ -1,0 +1,16 @@
+[package]
+name = "fabric-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fabric-core.workspace = true
+ed25519-dalek.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

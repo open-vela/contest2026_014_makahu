@@ -1,0 +1,5 @@
+/target/
+fabric.sqlite
+fabric-device.key
+*.sqlite-shm
+*.sqlite-wal

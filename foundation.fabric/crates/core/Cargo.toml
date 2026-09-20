@@ -1,0 +1,20 @@
+[package]
+name = "fabric-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+serde = ["dep:serde", "uuid/serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
