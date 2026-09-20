@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Device Fabric Hub</string>
+    <string name="connect_permission_label">Connect to Device Fabric Hub</string>
+    <string name="connect_permission_description">Allows an app to publish abilities and exchange bounded payloads through Device Fabric Hub.</string>
+</resources>
+

@@ -1,0 +1,23 @@
+# NuttX application build intermediates
+/app/buffer_app/*.o
+/app/buffer_app/*.su
+/app/buffer_app/Make.dep
+/app/buffer_app/.built
+/app/buffer_app/.depend
+
+# Python test cache and Windows download metadata
+__pycache__/
+*.pyc
+*:Zone.Identifier
+
+# Local builds, caches and credentials
+build/
+out/
+target/
+.gradle/
+.kotlin/
+local.properties
+signing.properties
+*.jks
+*.keystore
+/foundation.fabric/dist/

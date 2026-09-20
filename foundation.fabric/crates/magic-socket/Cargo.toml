@@ -1,0 +1,21 @@
+[package]
+name = "fabric-magic-socket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fabric-core.workspace = true
+fabric-net-report.workspace = true
+fabric-relay.workspace = true
+noq.workspace = true
+noq-udp.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+fabric-identity.workspace = true

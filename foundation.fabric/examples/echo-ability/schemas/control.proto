@@ -1,0 +1,3 @@
+syntax = "proto3";
+package example.echo.v1;
+message Echo { bytes opaque_payload = 1; }

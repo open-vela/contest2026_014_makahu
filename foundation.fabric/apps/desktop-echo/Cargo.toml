@@ -1,0 +1,15 @@
+[package]
+name = "fabric-desktop-echo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+eframe.workspace = true
+fabric-app-broker = { path = "../../crates/app-broker" }
+tokio.workspace = true
+

@@ -1,0 +1,280 @@
+syntax = "proto3";
+
+package device.fabric.v1;
+
+// 这是规范骨架。实现时必须继续按 docs/05-wire-control-protocol.md
+// 补齐每个消息字段、长度限制和 domain 转换测试。
+
+message Id128 { bytes value = 1; }
+message DeviceId { bytes sha256_public_key = 1; }
+
+message AbilityKey {
+  string namespace = 1;
+  string name = 2;
+  uint32 major = 3;
+}
+
+message AbilityContractRef {
+  AbilityKey key = 1;
+  bytes protocol_hash = 2;
+}
+
+message ProtocolError {
+  ErrorCode code = 1;
+  string safe_message = 2;
+  optional uint64 retry_after_ms = 3;
+  repeated Id128 related_ids = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  INVALID_ARGUMENT = 1;
+  UNSUPPORTED_VERSION = 2;
+  CONTRACT_MISMATCH = 3;
+  NOT_FOUND = 4;
+  ALREADY_EXISTS = 5;
+  UNAUTHENTICATED = 6;
+  PERMISSION_DENIED = 7;
+  POLICY_REQUIRES_USER_ACTION = 8;
+  RESOURCE_EXHAUSTED = 9;
+  STALE_EPOCH = 10;
+  SESSION_NOT_ACTIVE = 11;
+  PARTICIPANT_OFFLINE = 12;
+  CHANNEL_NOT_BOUND = 13;
+  MESSAGE_TOO_LARGE = 14;
+  BACKPRESSURE = 15;
+  CLOCK_UNAVAILABLE = 16;
+  CLOCK_UNCERTAIN = 17;
+  E2EE_REQUIRED = 18;
+  E2EE_NEGOTIATION_FAILED = 19;
+  TIMEOUT = 20;
+  INTERNAL = 21;
+}
+
+message HubHello {
+  repeated uint32 supported_protocol_versions = 1;
+  DeviceId device_id = 2;
+  bytes device_proof = 3;
+  bytes nonce = 4;
+  repeated string features = 5;
+}
+
+message LinkReady {
+  uint32 selected_protocol_version = 1;
+  bytes transcript_hash = 2;
+  uint64 link_generation = 3;
+}
+
+message RegistrySnapshotBegin {
+  uint64 revision = 1;
+}
+
+message OfferUpsert {
+  uint64 revision = 1;
+  bytes encoded_offer = 2;
+}
+
+message OfferRemove {
+  uint64 revision = 1;
+  Id128 ability_instance_id = 2;
+}
+
+message RegistrySnapshotEnd {
+  uint64 revision = 1;
+}
+
+message SessionPropose {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 expected_epoch = 3;
+  AbilityContractRef contract = 4;
+  bytes encoded_draft_plan = 5;
+  bytes opaque_ability_config = 6;
+  DeviceId sender_device_id = 7;
+  bytes message_nonce = 8;
+}
+
+message SessionAccept {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 expected_epoch = 3;
+  bytes acceptance = 4;
+  DeviceId sender_device_id = 5;
+  bytes message_nonce = 6;
+}
+
+message SessionReject {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  ProtocolError error = 3;
+  uint64 expected_epoch = 4;
+  DeviceId sender_device_id = 5;
+  bytes message_nonce = 6;
+}
+
+message SessionPrepare {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 next_epoch = 3;
+  bytes encoded_final_plan = 4;
+  bytes plan_hash = 5;
+  DeviceId sender_device_id = 6;
+  bytes message_nonce = 7;
+}
+
+message SessionReady {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 next_epoch = 3;
+  bytes plan_hash = 4;
+  DeviceId sender_device_id = 5;
+  bytes message_nonce = 6;
+}
+
+message SessionCommit {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 epoch = 3;
+  bytes plan_hash = 4;
+  DeviceId sender_device_id = 5;
+  bytes message_nonce = 6;
+}
+
+message SessionAbort {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  ProtocolError error = 3;
+  uint64 expected_epoch = 4;
+  DeviceId sender_device_id = 5;
+  bytes message_nonce = 6;
+}
+
+message ClockProbe {
+  Id128 clock_domain_id = 1;
+  uint64 sequence = 2;
+  uint64 t1_local_ns = 3;
+}
+
+message ClockReply {
+  Id128 clock_domain_id = 1;
+  uint64 sequence = 2;
+  uint64 t1_local_ns = 3;
+  sint64 t2_group_ns = 4;
+  sint64 t3_group_ns = 5;
+}
+
+message BarrierPrepare {
+  Id128 barrier_id = 1;
+  Id128 session_id = 2;
+  uint64 epoch = 3;
+  sint64 activate_at_group_ns = 4;
+  sint64 ready_deadline_group_ns = 5;
+  repeated Id128 participants = 6;
+  bytes opaque_context = 7;
+}
+
+message BarrierReady {
+  Id128 barrier_id = 1;
+  Id128 participant_id = 2;
+  uint64 estimated_uncertainty_ns = 3;
+}
+
+message BarrierCommit {
+  Id128 barrier_id = 1;
+  Id128 session_id = 2;
+  uint64 epoch = 3;
+}
+
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  CONTROL_STREAM_HELLO = 1;
+  HUB_HELLO = 2;
+  LINK_READY = 3;
+  REGISTRY_SNAPSHOT_BEGIN = 10;
+  OFFER_UPSERT = 11;
+  OFFER_REMOVE = 12;
+  REGISTRY_SNAPSHOT_END = 13;
+  REGISTRY_ACK = 14;
+  REGISTRY_RESYNC_REQUEST = 15;
+  SESSION_PROPOSE = 20;
+  SESSION_COUNTER_OFFER = 21;
+  SESSION_ACCEPT = 22;
+  SESSION_REJECT = 23;
+  SESSION_PREPARE = 24;
+  SESSION_READY = 25;
+  SESSION_NOT_READY = 26;
+  SESSION_COMMIT = 27;
+  SESSION_ABORT = 28;
+  SESSION_SUSPEND = 29;
+  SESSION_RESUME = 30;
+  SESSION_RECONFIGURE_PROPOSE = 31;
+  SESSION_RECONFIGURE_ACCEPT = 32;
+  SESSION_RECONFIGURE_COMMIT = 33;
+  SESSION_CLOSE = 34;
+  CLOCK_PROBE = 40;
+  CLOCK_REPLY = 41;
+  CLOCK_STATUS = 42;
+  BARRIER_PREPARE = 43;
+  BARRIER_READY = 44;
+  BARRIER_REJECT = 45;
+  BARRIER_COMMIT = 46;
+  BARRIER_ABORT = 47;
+  PAIRING_START = 50;
+  PAIRING_CHALLENGE = 51;
+  PAIRING_CONFIRM = 52;
+  PAIRING_COMPLETE = 53;
+  APP_ATTESTATION_REQUEST = 54;
+  APP_ATTESTATION_RESPONSE = 55;
+  E2EE_KEY_OFFER = 56;
+  E2EE_KEY_ACCEPT = 57;
+  GROUP_KEY_ROTATE = 58;
+  POLICY_DENIED = 59;
+}
+
+message ControlStreamHello { uint64 link_generation = 1; }
+message RegistryAck { uint64 revision = 1; }
+message RegistryResyncRequest { uint64 applied_revision = 1; }
+
+message SessionControlHeader {
+  Id128 operation_id = 1;
+  Id128 session_id = 2;
+  uint64 expected_epoch = 3;
+  DeviceId sender_device_id = 4;
+  bytes message_nonce = 5;
+}
+
+message SessionCounterOffer { SessionControlHeader header = 1; bytes encoded_plan = 2; }
+message SessionNotReady { SessionControlHeader header = 1; ProtocolError error = 2; }
+message SessionSuspend { SessionControlHeader header = 1; string reason = 2; }
+message SessionResume { SessionControlHeader header = 1; bytes resume_token = 2; }
+message SessionReconfigurePropose { SessionControlHeader header = 1; bytes encoded_plan = 2; }
+message SessionReconfigureAccept { SessionControlHeader header = 1; bytes plan_hash = 2; }
+message SessionReconfigureCommit { SessionControlHeader header = 1; bytes plan_hash = 2; uint64 epoch = 3; }
+message SessionClose { SessionControlHeader header = 1; string reason = 2; }
+message ClockStatus { SessionControlHeader header = 1; uint64 uncertainty_ns = 2; }
+message BarrierReject { SessionControlHeader header = 1; Id128 barrier_id = 2; ProtocolError error = 3; }
+message BarrierAbort { SessionControlHeader header = 1; Id128 barrier_id = 2; ProtocolError error = 3; }
+
+message PairingStart { bytes nonce = 1; bytes device_proof = 2; string device_label = 3; }
+message PairingChallenge { bytes nonce = 1; bytes transcript_hash = 2; }
+message PairingConfirm { bytes transcript_hash = 1; bool user_confirmed = 2; }
+message PairingComplete { DeviceId device_id = 1; string device_label = 2; }
+message AppAttestationRequest { Id128 ability_instance_id = 1; bytes nonce = 2; }
+message AppAttestationResponse { bytes signed_attestation = 1; }
+message E2eeKeyOffer { SessionControlHeader header = 1; bytes key_offer = 2; }
+message E2eeKeyAccept { SessionControlHeader header = 1; bytes key_accept = 2; }
+message GroupKeyRotate { SessionControlHeader header = 1; bytes key_material = 2; }
+message PolicyDenied { SessionControlHeader header = 1; ProtocolError error = 2; }
+
+message StreamOpen {
+  fixed32 protocol_magic = 1;
+  Id128 session_id = 2;
+  uint64 epoch = 3;
+  Id128 channel_id = 4;
+  Id128 sender_participant = 5;
+  Id128 destination_binding_id = 6;
+  uint64 stream_flags = 7;
+  bytes e2ee_header = 8;
+}
+
+

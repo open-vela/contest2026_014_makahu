@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:padding="12dp" android:background="#F4F7F5">
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="@string/capture_widget_title" android:textStyle="bold"
+        android:textSize="16sp" android:textColor="#163E30" />
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal">
+        <Button android:id="@+id/capture_text" android:layout_width="0dp"
+            android:layout_height="48dp" android:layout_weight="1"
+            android:backgroundTint="#DDECE4" android:text="@string/capture_text" android:textColor="#163E30" />
+        <Button android:id="@+id/capture_voice" android:layout_width="0dp"
+            android:layout_height="48dp" android:layout_weight="1"
+            android:backgroundTint="#DDECE4" android:text="@string/capture_voice" android:textColor="#163E30" />
+    </LinearLayout>
+</LinearLayout>

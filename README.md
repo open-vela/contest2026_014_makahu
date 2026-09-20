@@ -1,148 +1,117 @@
-# contest2026_014_makahu
+# Buffer：个人意识缓冲区
 
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
+## 一、作品简介
 
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `014`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
+Buffer 将随手记下的灵感、问题、待办和生活记录保存下来，再由手机侧 AI 服务完成分类、查找旧记录、关联主题和整理展示内容。openvela 设备承担屏幕录音、离线队列和桌面卡片展示，Android 承担数据存储、语音转写、LLM 编排和设备同步。
 
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
+文字与语音转写共用整理流程；卡片详情读取已保存的结果，并展示真实处理记录，不在点击时再次请求分类。七日回顾由 LLM 根据实际记录生成。录音未转写前留在待处理队列，不混入收藏。日历及健康数据写入需要用户确认与系统授权。
 
----
+## 二、选题方向
 
-## 一、先读这些官方文档
+**AI 硬件产品创新**。以 openvela 设备作为低干扰入口，以 Android 作为联网与 AI 协同端，探索多设备上的记录、回顾与轻提醒。当前主要验证环境为 openvela 模拟器与 Android 17 模拟器；保留 Gemini S1 的设备应用实现。
 
-**通用（所有赛道必读）：**
+## 三、目录结构
 
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
+```text
+app/buffer_app/                    openvela 应用：屏幕、录音、配网配对与同步
+board/vela_sim/configs/            goldfish-arm64 模拟器配置
+foundation.fabric/                Foundation Fabric 源码快照，无嵌套 Git 仓库
+  apps/android/buffer-app/         Buffer Android（data / domain / ui）
+  apps/android/fabric-sdk/         Android Fabric SDK
+  apps/android/hub-app/            Fabric Hub
+  crates/                         Fabric Rust 组件
+  protocol/                       协议定义
+data/agent/skills/                运行时 Skill 资源，未接入调用
+docs/                             产品协议、历史审核与提交报告
+tests/                            openvela 应用主机回归测试
+third_party/material-symbols/     图标来源与许可
+logs/6xingyv/                     本次真实 Codex 对话 JSONL 与清单
+contest2026_014_makahu.xml         openvela repo manifest 与应用 linkfile
+```
 
-**按你的赛道选读（三选一）：**
+Android Studio 打开 `foundation.fabric/apps/android/`。Android 模块边界见 [ARCHITECTURE.md](foundation.fabric/apps/android/buffer-app/ARCHITECTURE.md)。比赛目录内包含一份可构建源码，不依赖开发者原有的 `/home/simon/projects/mocha/` 路径。原 Foundation Fabric 来源为 <https://github.com/6xingyv/foundation.fabric>，基线 `e724a2a7935cb0460aa39e0739d320e27d97d4af`，包含本次 Buffer 开发修改；不附带其历史提交、旧 APK/EXE 或构建缓存。
 
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
+## 四、运行方式
 
----
+### 拉取 openvela 工作区
 
-## 二、第一步：拉取完整工程
+在空目录执行（需安装 `repo` 及 openvela 构建依赖）：
 
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
-
-```bash
-repo init -u https://github.com/open-vela/contest2026_014_makahu \
+```sh
+repo init -u https://github.com/6xingyv/contest2026_014_makahu \
   -b dev-ai-contest-2026 -m contest2026_014_makahu.xml
 repo sync -c -j8
 ```
 
-同步后，你的整个仓库位于工作区的 `contest2026_014_makahu/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
+本仓的应用由 manifest 映射到 `packages/demos/contest2026_014_buffer_app`。若已有工作区，更新本仓后重新同步 linkfile，或确认该位置指向 `app/buffer_app/`。
 
----
+### Android
 
-## 三、第二步：在哪里写代码
+环境：JDK 21、Android SDK；通过 `ANDROID_HOME` 或本机 `local.properties` 指定 SDK，后者不提交。
 
-**只在自己的仓目录 `contest2026_014_makahu/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
-
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/hello_app/`           | `packages/demos/contest2026_014_hello_app`     |
-| 快应用   | `quickapp/hello_quickapp/` | `packages/apps/contest2026_014_hello_quickapp` |
-| 板级适配 | `board/contest_board/`     | `vendor/openvela/boards/contest2026_014_board` |
-
-> 用不到的形态目录可以删掉；新增作品时按同样规则加子目录，并在 `contest2026_014_makahu.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | quickapp/ | board/   # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
+```sh
+cd contest2026_014_makahu/foundation.fabric/apps/android
+bash gradlew :buffer-app:assembleDebug :buffer-app:lintDebug :buffer-app:testDebugUnitTest
+adb -s <Android设备序列号> install -r buffer-app/build/outputs/apk/debug/buffer-app-debug.apk
+adb -s <Android设备序列号> shell am start -n com.mocharealm.foundation.fabric.buffer/.MainActivity
 ```
 
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
+在设置中填写 OpenAI-compatible Base URL、模型与密钥。当前默认模型为 `mimo-v2.5`，语音转写为 `mimo-v2.5-asr`；密钥只保存在手机侧。未配置时仍可本地记录，AI 任务等待配置。手机 AAC 录音先转换成 WAV，再提交 ASR。
 
----
+### openvela 模拟器
 
-## 四、第三步：编译与运行
+在 openvela 工作区根目录执行：
 
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
-
-```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
-
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
+```sh
+./build.sh contest2026_014_makahu/board/vela_sim/configs/goldfish-arm64 -j4
 ```
 
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` `quickapp/` `board/` 三个示例骨架对应的 Kconfig 选项可通过 `menuconfig` 启用。
+配置启用 Buffer、显示、网络及相关设备功能。将该配置生成的镜像交给匹配的 openvela goldfish-arm64 模拟器启动，在 NSH 执行：
 
----
+```sh
+buffer_app
+```
 
-## 五、第四步：提交作品
+Windows 模拟器来自 [open-vela/prebuilts_emulator_windows-x86_64](https://github.com/open-vela/prebuilts_emulator_windows-x86_64)。模拟器版本、镜像架构和数据盘格式需要匹配；Vela 模拟器不能直接用 Android 系统镜像。当前项目不提供 Gemini S1 全容量刷机 IMG。
 
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
+Android 与 Vela 应可互相访问。物理局域网可用发现与配对；两个模拟器各自的 NAT 网络通常无法直接转发广播，需要配置宿主端口转发。Vela 模拟器配置使用 `eth0` 与宿主网关 `10.0.2.2`。Android 模拟器桥接服务可转发到宿主：
 
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
+```sh
+adb -s <Android设备序列号> forward tcp:48888 tcp:48888
+```
 
-### 关于 PR 与 CLA
+此转发只解决数据端口，不代表完成发现或配对；仍需通过设备入口完成认证，禁止通过伪造绑定绕过配对。BLE 配网的物理射频能力不能仅凭两个模拟器验证。
 
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
+### Gemini S1 保留路径
 
----
+设备侧支持屏幕按住录音、松开保存，配对成功后隐藏配对码。物理设备构建、Wi-Fi 与调试命令见 [设备端说明](app/buffer_app/README.md)。S1 尚未完成本次实机联合验收；此轮以模拟器为主，不将可编译表述为已烧录验证。
 
-## 六、提交前：把本 README 改成你的作品说明
+### 运行时 Skill
 
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
+[data/agent/](data/agent/README.md) 归档四类能力：记录整理、问题回答、七日回顾、语音转写。其中分类整理包含 `search_records`、`read_record` 两个只读 function call 定义。
 
-```markdown
-# <你的作品名>
+**这些外置 Skill 仅整理，不调用。** 未加入 Android assets、Vela ROMFS 或自动加载器；`catalog.json` 标记为 disabled。已有 Android 代码中的 LLM 流程保持运行，不能把资源归档理解为已接通设备 `/data/agent/skills/` 加载能力。
 
-## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
+### 校验
 
-## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
+Android 使用上述 Gradle 命令。Vela 应用可在 Linux 主机运行边界测试：
 
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `quickapp/xxx/`   — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
+```sh
+cd contest2026_014_makahu
+for test in tests/test_*.py; do python3 "$test" || exit 1; done
+```
 
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
+主机测试不代替蓝牙、麦克风、刷机等实机验收。历史阶段性审核见 `docs/`，报告中的旧路径、旧计数和问题状态应结合其日期阅读。
 
 ## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
-```
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+开发中使用 Codex 协助需求拆解、Android/openvela 协议设计、代码实现、编译排错、测试、Material 3 界面调整和提交文档整理。用户持续提出交互与职责约束，AI 依据真实代码、编译结果及模拟器截图迭代；分类工具循环、持久化、任务租约和设备协议通过测试校验。AI 也暴露了实际问题，例如转写静音输入、分类失败不可见和详情表单过密，并参与修复。
 
----
+真实对话按 [logs/README.md](logs/README.md) 归档到 `logs/6xingyv/`。使用组委会 `contest-log-collector` 1.3.0 的 Codex 原生解析器导出当前会话，保持原始时间与正文并应用工具内置脱敏。该导出器输出用户/助手可见文本，不导出截图、内部推理或工具调用明细；它是会话导出时刻的快照，不是伪造或补写的开发记录。截止点见 manifest 与 [导出说明](docs/ai-coding-log-export.md)。
 
-## 附：仓库命名规范
+## 六、当前边界
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_014_makahu`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+- 手机承担当前 AI 编排职责，模型通过兼容接口调用；不是在手机上加载模型权重。
+- 手机优先、Vela 次优先的自动 Coordinator 选举尚未实现，不能据此声称支持自动故障接管。
+- 配网与配对代码已存在，模拟器、主机测试及物理射频验收范围不同；S1 实机链路未完成验收。
+- 报告位于 [Buffer-技术报告.md](docs/submission/Buffer-技术报告.md)；视频、最终团队填写项等需按实际参赛材料补齐。

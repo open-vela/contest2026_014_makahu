@@ -1,0 +1,48 @@
+[package]
+name = "fabric-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+fabric-core = { workspace = true, features = ["serde"] }
+fabric-discovery.workspace = true
+fabric-identity.workspace = true
+fabric-ipc.workspace = true
+fabric-link.workspace = true
+fabric-protocol.workspace = true
+fabric-registry.workspace = true
+fabric-session.workspace = true
+fabric-storage.workspace = true
+fabric-policy.workspace = true
+fabric-clock = { workspace = true, optional = true }
+fabric-crypto = { workspace = true, optional = true }
+fabric-transport-quic = { workspace = true, optional = true }
+fabric-relay = { workspace = true, optional = true }
+fabric-discovery-mdns = { workspace = true, optional = true }
+fabric-discovery-ble = { workspace = true, optional = true }
+fabric-discovery-wifi-aware = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+rand_core.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+
+[features]
+default = ["quic", "mdns", "clock"]
+quic = ["dep:fabric-transport-quic", "dep:fabric-relay"]
+mdns = ["dep:fabric-discovery-mdns"]
+ble = ["dep:fabric-discovery-ble"]
+wifi-aware = ["dep:fabric-discovery-wifi-aware"]
+clock = ["dep:fabric-clock"]
+e2ee = ["dep:fabric-crypto"]
+
+[dev-dependencies]
+fabric-clock.workspace = true
+tokio.workspace = true
