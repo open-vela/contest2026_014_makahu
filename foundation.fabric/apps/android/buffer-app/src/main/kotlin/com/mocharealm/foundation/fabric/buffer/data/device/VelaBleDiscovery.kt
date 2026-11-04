@@ -10,7 +10,7 @@ import android.os.*
 import java.util.UUID
 
 /** Discovery hints are untrusted until the device authenticates. */
-internal data class VelaBlePeer(val address: String, val name: String, val rssi: Int)
+internal data class VelaBlePeer(val address: String, val name: String, val rssi: Int, val fabricMessages: Boolean = false)
 
 internal class VelaBleDiscovery(context: Context) : AutoCloseable {
     private val context = context.applicationContext
@@ -51,12 +51,14 @@ internal class VelaBleDiscovery(context: Context) : AutoCloseable {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     handler.post {
                         if (session != generation || stopScan == null) return@post
-                        if (result.scanRecord?.serviceUuids?.contains(ParcelUuid(SERVICE_UUID)) != true) return@post
+                        val services = result.scanRecord?.serviceUuids.orEmpty()
+                        val fabric = services.contains(ParcelUuid(FABRIC_SERVICE_UUID))
+                        if (!fabric && !services.contains(ParcelUuid(SERVICE_UUID))) return@post
                         try {
                             val address = result.device.address
                             if (address !in peers && peers.size >= 32) return@post
                             peers[address] = VelaBlePeer(address,
-                                result.scanRecord?.deviceName?.take(40) ?: "Gemini S1", result.rssi)
+                                result.scanRecord?.deviceName?.take(40) ?: "Gemini S1", result.rssi, fabric)
                             onPeers(peers.values.sortedByDescending { it.rssi })
                         } catch (_: SecurityException) { finish("蓝牙权限已撤销") }
                     }
@@ -69,7 +71,7 @@ internal class VelaBleDiscovery(context: Context) : AutoCloseable {
                 }
             }
             stopScan = { scanner.stopScan(callback) }
-            scanner.startScan(listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build()),
+            scanner.startScan(listOf(SERVICE_UUID, FABRIC_SERVICE_UUID).map { ScanFilter.Builder().setServiceUuid(ParcelUuid(it)).build() },
                 ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build(), callback)
             handler.postDelayed({ finish(if (peers.isEmpty()) "未发现待添加设备，请确认 S1 已进入添加模式" else "扫描完成") }, 10_000)
         } catch (_: SecurityException) {
@@ -95,6 +97,7 @@ internal class VelaBleDiscovery(context: Context) : AutoCloseable {
 
     companion object {
         val SERVICE_UUID: UUID = UUID.fromString("487e1000-7d32-4e0a-9c6b-3f62bd52b101")
+        val FABRIC_SERVICE_UUID: UUID = UUID.fromString("7f6d0001-6b4e-4a30-9e8f-464142524943")
         fun permissions(): Array<String> = if (Build.VERSION.SDK_INT >= 31) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)

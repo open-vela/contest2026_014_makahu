@@ -13,6 +13,9 @@ import androidx.health.connect.client.records.Record
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.units.Volume
+import androidx.health.connect.client.units.Energy
+import androidx.health.connect.client.units.Mass
+import com.mocharealm.foundation.fabric.buffer.domain.HealthQuant
 import java.time.Instant
 import java.time.ZoneId
 import java.util.Locale
@@ -28,7 +31,11 @@ class HealthConnectExporter(context: Context) {
         HealthConnectClient.getOrCreate(appContext)
     }
 
-    suspend fun export(card: BufferCard): HealthExportResult {
+    suspend fun export(card: BufferCard): HealthExportResult = exportInternal(card,null)
+
+    internal suspend fun exportQuantified(card:BufferCard, quant:HealthQuant?):HealthExportResult = exportInternal(card,quant)
+
+    private suspend fun exportInternal(card:BufferCard,quant:HealthQuant?):HealthExportResult {
         val category = card.healthCategory
             ?: return HealthExportResult.Unsupported("这张记录没有健康数据分类")
         val permissions = requiredPermissions(category)
@@ -47,7 +54,7 @@ class HealthConnectExporter(context: Context) {
             return HealthExportResult.Failed("尚未授予 Health Connect 写入权限")
         }
 
-        val record = createRecord(card, category)
+        val record = createRecord(card, category,quant)
             ?: return HealthExportResult.NeedsDetail(detailMessage(category))
         val recordType = record::class.simpleName ?: "HealthRecord"
         return try {
@@ -58,9 +65,14 @@ class HealthConnectExporter(context: Context) {
         }
     }
 
-    private fun createRecord(card: BufferCard, category: String): Record? {
-        val start = Instant.ofEpochMilli(card.createdAt)
-        val offset = ZoneId.systemDefault().rules.getOffset(start)
+    internal fun createRecord(card: BufferCard, category: String,quant:HealthQuant?=null): Record? {
+        quant?.let { HealthQuant.parse(it.json().toString()) }
+        val captured=Instant.ofEpochMilli(card.createdAt)
+        val start = if(quant==null)captured else java.time.LocalDate.parse(quant.date)
+            .atTime(captured.atZone(ZoneId.of(quant.zone)).toLocalTime()).atZone(ZoneId.of(quant.zone)).toInstant()
+        fun total(metric:String):Double?=quant?.entries?.mapNotNull { it.values[metric] }?.takeIf {it.isNotEmpty()}?.sum()
+        if(category=="nutrition" && listOf("energy_kcal","protein_g","carbs_g","fat_g").none {total(it)!=null})return null
+        val offset = ZoneId.of(quant?.zone ?: ZoneId.systemDefault().id).rules.getOffset(start)
         val metadata = Metadata.manualEntry(clientRecordId = "buffer-${card.cardId}")
         val summary = card.summary.take(MAX_NOTE_LENGTH)
 
@@ -71,11 +83,15 @@ class HealthConnectExporter(context: Context) {
                 endTime = start.plusSeconds(EVENT_INTERVAL_SECONDS),
                 endZoneOffset = offset,
                 metadata = metadata,
-                name = summary,
+                name = if(quant==null)summary else (if(quant.entries.any {it.basis=="estimated"})"[含估算] " else "")+quant.entries.joinToString("、"){it.name} + (if(quant.entries.any {it.values.isEmpty()})" [部分食物数值缺失]" else ""),
+                energy = total("energy_kcal")?.let(Energy::kilocalories),
+                protein = total("protein_g")?.let(Mass::grams),
+                totalCarbohydrate = total("carbs_g")?.let(Mass::grams),
+                totalFat = total("fat_g")?.let(Mass::grams),
                 mealType = MealType.MEAL_TYPE_UNKNOWN,
             )
             "hydration" -> {
-                val milliliters = parseVolumeMilliliters(card.summary) ?: return null
+                val milliliters = total("water_ml") ?: parseVolumeMilliliters(card.summary) ?: return null
                 HydrationRecord(
                     startTime = start,
                     startZoneOffset = offset,
@@ -86,7 +102,7 @@ class HealthConnectExporter(context: Context) {
                 )
             }
             "exercise" -> {
-                val minutes = parseDurationMinutes(card.summary) ?: return null
+                val minutes = total("exercise_min")?.toLong() ?: parseDurationMinutes(card.summary) ?: return null
                 ExerciseSessionRecord(
                     startTime = start,
                     startZoneOffset = offset,
@@ -99,7 +115,7 @@ class HealthConnectExporter(context: Context) {
                 )
             }
             "sleep" -> {
-                val minutes = parseDurationMinutes(card.summary) ?: return null
+                val minutes = total("sleep_min")?.toLong() ?: parseDurationMinutes(card.summary) ?: return null
                 SleepSessionRecord(
                     startTime = start,
                     startZoneOffset = offset,
@@ -163,6 +179,7 @@ class HealthConnectExporter(context: Context) {
     }
 
     private fun detailMessage(category: String): String = when (category) {
+        "nutrition" -> "请先核对并确认饮食的热量或营养素数值"
         "hydration" -> "饮水记录需要包含数量，例如“喝水 300 ml”"
         "exercise" -> "运动记录需要包含时长，例如“走路 30 分钟”"
         "sleep" -> "睡眠记录需要包含时长，例如“睡了 8 小时”"

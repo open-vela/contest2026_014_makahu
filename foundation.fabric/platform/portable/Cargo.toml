@@ -1,0 +1,28 @@
+[package]
+name = "fabric-portable"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# Separate workspace avoids std feature unification with the desktop Hub.
+[workspace]
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+curve25519-dalek = { version = "4", default-features = false, features = ["precomputed-tables", "zeroize"] }
+sha2 = { version = "0.10", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false }
+zeroize = { version = "1", default-features = false }
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

@@ -1,0 +1,27 @@
+{
+  "assets": [
+    {
+      "key": "recipe/kelp-braised-pork",
+      "title": "海带红烧肉",
+      "source": ".validation/design/Assistant Session Recipe Full.svg",
+      "sha256": "b943107218b8f86426d707e0c26f48bdb6be317cac9edc61f97735aed4ce6eaf",
+      "embedded_sha256": "ae7b0f843ad111ec31140eb42c703635c682892ea9bcde7026910f55f373b773",
+      "conversion": "Center crop embedded photograph to 116x106, RGB565; all borders/radii rendered by LVGL",
+      "user_provided": true
+    },
+    {
+      "key": "surface/listening",
+      "source": ".validation/design/Assistant Listening.svg",
+      "sha256": "0e67e2e17c2ffc881bcab98d3ecd0cb94485cb19565dbb6bc8260f1f6a6b1d6e",
+      "conversion": "SVG linear + two transformed radial gradients composited at 320x203; ordered-dither RGB565; native LVGL draw-image scaling",
+      "user_provided": true
+    },
+    {
+      "key": "surface/session",
+      "source": ".validation/design/Assistant Session Timer.svg",
+      "sha256": "590d622f0ba8b4ee37f1d792b3ea734a0f4f2f945a603e1aa81943f73748decd",
+      "conversion": "SVG linear + two transformed radial gradients composited at 320x203; ordered-dither RGB565; native LVGL draw-image scaling",
+      "user_provided": true
+    }
+  ]
+}

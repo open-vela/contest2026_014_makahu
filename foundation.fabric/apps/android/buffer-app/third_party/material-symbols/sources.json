@@ -89,6 +89,16 @@
       "resource": "ms_history_filled",
       "source": "https://raw.githubusercontent.com/google/material-design-icons/27e9ef1dbeedc13d682fece4a58e1eda4cb0961a/symbols/web/history/materialsymbolsrounded/history_fill1_24px.svg",
       "svg_sha256": "98a0aacd0f8de1393b7fd627f3a4958986c33009192d59f022269505df6dbe51"
+    },
+    {
+      "resource": "ms_info",
+      "source": "https://raw.githubusercontent.com/google/material-design-icons/27e9ef1dbeedc13d682fece4a58e1eda4cb0961a/symbols/web/info/materialsymbolsrounded/info_24px.svg",
+      "svg_sha256": "ab779a17ff3bc8f5a30e3231509ef9ff6fee709ffcaa46fb65217ce170f03e14"
+    },
+    {
+      "resource": "ms_alarm",
+      "source": "https://raw.githubusercontent.com/google/material-design-icons/27e9ef1dbeedc13d682fece4a58e1eda4cb0961a/symbols/web/alarm/materialsymbolsrounded/alarm_24px.svg",
+      "svg_sha256": "6c1ee984885650fa982c0b0da9ed94ca1a25df6af0e40188ce08de049631c086"
     }
   ]
 }

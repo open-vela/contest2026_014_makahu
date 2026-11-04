@@ -1,20 +1,23 @@
 """Compile production BLE discovery against a controlled framework boundary."""
+from host_support import PROJECT_ROOT, CC
 from pathlib import Path
 import re
 import subprocess
 import tempfile
 import uuid
 
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root / 'app/buffer_app/buffer_ble.c').read_text()
 android = root / 'foundation.fabric/apps/android/buffer-app/src/main/kotlin/com/mocharealm/foundation/fabric/buffer/data/device/VelaBleDiscovery.kt'
 # The submission includes both applications; a missing peer source is a failure.
 assert android.is_file(), android
 if android.exists():
-    service = re.search(r'UUID.fromString\("([^"\n]+)"\)', android.read_text()).group(1)
-    packet = source.split('g_advertisement[] = {', 1)[1].split('};', 1)[0]
-    values = [int(x.strip(), 0) for x in packet.split(',') if x.strip()]
-    assert uuid.UUID(bytes=bytes(reversed(values[5:]))) == uuid.UUID(service)
+    services = re.findall(r'UUID.fromString\("([^"\n]+)"\)', android.read_text())
+    packets = source.split('g_advertisement[] = {')[1:]
+    assert len(packets) == 2 and len(services) == 2
+    for packet, service in zip(packets, reversed(services)):
+        values = [int(x.strip(), 0) for x in packet.split('};', 1)[0].split(',') if x.strip()]
+        assert uuid.UUID(bytes=bytes(reversed(values[5:]))) == uuid.UUID(service)
 source = re.sub(r'^#include .*$', '', source, flags=re.M)
 harness = r'''
 #include <assert.h>
@@ -25,15 +28,21 @@ harness = r'''
 #include <pthread.h>
 #include <stdio.h>
 #include <time.h>
+#include <signal.h>
 #define CONFIG_BUFFER_VELA_BLE 1
 #define BUFFER_ID_SIZE 80
 #define BT_ADV_STATUS_SUCCESS 0
 #define BT_ADAPTER_STATE_ON 1
+#define BT_ADAPTER_STATE_OFF 0
+#define BT_ADAPTER_STATE_BLE_ON 2
+#define BT_STATUS_SUCCESS 0
 #define BT_LE_LEGACY_ADV_IND 5
 #define BT_LE_ADDR_TYPE_PUBLIC 0
 #define BT_LE_ADV_CHANNEL_DEFAULT 0
 #define BT_LE_ADV_FILTER_WHITE_LIST_FOR_NONE 0
 typedef int bt_instance_t;
+typedef int bt_adapter_state_t;
+typedef int bt_status_t;
 typedef int bt_advertiser_t;
 typedef struct { int adv_type, own_addr_type, interval, channel_map, filter_policy; } ble_adv_params_t;
 typedef struct {
@@ -43,15 +52,25 @@ typedef struct {
 } advertiser_callback_t;
 static int pairing = -ENOENT, adapter = 1, instance, adv, starts, stops, deletes;
 static int start_status;
+static int enable_result, enable_calls;
+static int usleep(unsigned value) { (void)value; return 0; }
+static bt_status_t bt_adapter_enable_le(bt_instance_t *p)
+{ (void)p; enable_calls++; if (!enable_result) adapter=BT_ADAPTER_STATE_BLE_ON; return enable_result; }
 static bool allocate_fail, adv_fail;
 static advertiser_callback_t *callbacks;
 static pthread_t stopper;
 static bool stop_thread;
 static int buffer_ble_service_start(void *p) { (void)p; return 0; }
 static void buffer_ble_service_stop(void) {}
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+static bool buffer_fabric_accepting_connections(void) { return true; }
+#else
 static bool buffer_ble_service_busy(void) { return false; }
+#endif
+#ifndef CONFIG_BUFFER_VELA_FABRIC
 static int buffer_store_load_pairing(char *h, size_t a, char *t, size_t b, char *p, size_t c)
 { (void)h; (void)a; (void)t; (void)b; (void)p; (void)c; return pairing; }
+#endif
 static void buffer_set_status(const char *format, ...) { (void)format; }
 static bt_instance_t *bluetooth_create_instance(void) { return allocate_fail ? NULL : &instance; }
 static void bluetooth_delete_instance(bt_instance_t *p) {
@@ -65,7 +84,11 @@ static bt_advertiser_t *bt_le_start_advertising(bt_instance_t *p, ble_adv_params
   assert(params->adv_type == BT_LE_LEGACY_ADV_IND);
   assert(n == 21 && m <= 31 && (size_t)rsp[0] + 1 == m);
   assert(data[0] == 2 && data[3] == 17 && data[4] == 7);
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+  const uint8_t uuid[] = {0x43,0x49,0x52,0x42,0x41,0x46,0x8f,0x9e,0x30,0x4a,0x4e,0x6b,1,0,0x6d,0x7f};
+#else
   const uint8_t uuid[] = {1,0xb1,0x52,0xbd,0x62,0x3f,0x6b,0x9c,0x0a,0x4e,0x32,0x7d,0,0x10,0x7e,0x48};
+#endif
   for (int i=0; i<16; i++) assert(data[5+i] == uuid[i]);
   if (adv_fail) return NULL;
   cb->on_advertising_start(&adv, 3, start_status);
@@ -79,27 +102,41 @@ static void bt_le_stop_advertising_id(bt_instance_t *p, uint8_t id) {
 void buffer_ble_stop(void);
 ''' + source + r'''
 int main(void) {
+#ifndef CONFIG_BUFFER_VELA_FABRIC
   pairing=0; assert(buffer_ble_start()==0 && starts==0);
   pairing=-EACCES; assert(buffer_ble_start()==-EACCES && starts==0);
+#endif
   pairing=-ENOENT; allocate_fail=true; assert(buffer_ble_start()==-ENODEV);
-  allocate_fail=false; adapter=0; assert(buffer_ble_start()==-EAGAIN && deletes==1);
+  assert(raise(SIGPIPE)==0); /* daemon IPC disconnect must not kill the app */
+  allocate_fail=false; adapter=0; enable_result=1;
+  assert(buffer_ble_start()==-EIO && deletes==1 && enable_calls==1);
   adapter=1; adv_fail=true; assert(buffer_ble_start()==-EIO && deletes==2);
   adv_fail=false; start_status=1; assert(buffer_ble_start()==-EIO && deletes==3);
   start_status=0;
+  adapter=BT_ADAPTER_STATE_OFF; enable_result=0;
   for (int i=0; i<3; i++) {
     assert(buffer_ble_start()==0); int count=starts;
     assert(buffer_ble_start()==0 && starts==count);
     buffer_ble_stop(); assert(stops==i+1);
     buffer_ble_stop(); assert(stops==i+1);
   }
+  assert(enable_calls==2 && adapter==BT_ADAPTER_STATE_BLE_ON);
   assert(buffer_ble_start()==0);
   callbacks->on_advertising_stopped(&adv,3);
-  buffer_ble_stop(); assert(stops==3); /* no stale advertiser handle */
+  int previous_deletes=deletes;
+  assert(buffer_ble_start()==0 && deletes==previous_deletes);
+  buffer_ble_stop(); assert(stops==4); /* reconnect retains the GATT instance */
   puts("BLE discovery payload and lifecycle passed");
 }
 '''
 with tempfile.TemporaryDirectory() as d:
     c = Path(d) / 'test.c'
     c.write_text(harness)
-    subprocess.run(['cc', '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', d+'/test'], check=True)
+    subprocess.run([*CC, '-std=c11', '-D_POSIX_C_SOURCE=200809L', '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', d+'/test'], check=True)
     subprocess.run([d+'/test'], check=True, timeout=20)
+
+    # The Fabric carrier must advertise reconnect availability after binding;
+    # trust/session admission, rather than discovery silence, prevents re-claim.
+    subprocess.run([*CC, '-std=c11', '-DCONFIG_BUFFER_VELA_FABRIC=1', '-D_POSIX_C_SOURCE=200809L',
+                    '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', d+'/fabric-test'], check=True)
+    subprocess.run([d+'/fabric-test'], check=True, timeout=20)

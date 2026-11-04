@@ -1,0 +1,17 @@
+diff --git a/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig b/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
+--- a/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
++++ b/boards/r528/r528s3-gemini-s1/configs/nsh_minidisplay/defconfig
+@@ -313,6 +313,8 @@
+ CONFIG_LCD_EXTERNINIT=y
+ CONFIG_LCD_FRAMEBUFFER=y
+ CONFIG_LCD_ILI9341=y
+ CONFIG_LCD_ILI9341_IFACE0=y
++CONFIG_LCD_ILI9341_R528_PWM_BACKLIGHT=y
++CONFIG_LCD_MAXPOWER=255
+ CONFIG_LCD_SUPPORT_ILI9341=y
+ CONFIG_LED_RGB_TEST=y
+@@ -337,3 +339,4 @@
+ CONFIG_LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP=y
++CONFIG_BUFFER_VELA_NIGHT_DIM=y
+ CONFIG_LV_BIN_DECODER_RAM_LOAD=y
+ CONFIG_LV_CACHE_DEF_SIZE=1048576

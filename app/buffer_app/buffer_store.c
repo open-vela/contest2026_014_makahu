@@ -7,6 +7,11 @@
 #include <nuttx/config.h>
 
 #include "buffer_app.h"
+#include "buffer_fabric.h"
+#include "buffer_oobe.h"
+#include "buffer_deck.h"
+#include "buffer_source_events.h"
+#include "buffer_private_storage.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -28,6 +33,10 @@
 #define BUFFER_PAIRING_CODE_TMP CONFIG_BUFFER_VELA_DATA_DIR "/pairing.code.tmp"
 #define BUFFER_FOCUS_FILE CONFIG_BUFFER_VELA_DATA_DIR "/focus.conf"
 #define BUFFER_FOCUS_TMP CONFIG_BUFFER_VELA_DATA_DIR "/focus.conf.tmp"
+#define BUFFER_OOBE_STATE_FILE CONFIG_BUFFER_VELA_DATA_DIR "/oobe.conf"
+#define BUFFER_OOBE_STATE_TMP CONFIG_BUFFER_VELA_DATA_DIR "/oobe.conf.tmp"
+#define BUFFER_OOBE_COMPLETION_FILE CONFIG_BUFFER_VELA_DATA_DIR "/oobe.completed"
+#define BUFFER_OOBE_COMPLETION_TMP CONFIG_BUFFER_VELA_DATA_DIR "/oobe.completed.tmp"
 #define BUFFER_MODE_FILE CONFIG_BUFFER_VELA_DATA_DIR "/mode.conf"
 #define BUFFER_MODE_TMP CONFIG_BUFFER_VELA_DATA_DIR "/mode.conf.tmp"
 #define BUFFER_PENDING_ACTION_FILE CONFIG_BUFFER_VELA_DATA_DIR "/pending.action"
@@ -37,6 +46,16 @@
 #define BUFFER_CARDS_FILE CONFIG_BUFFER_VELA_DATA_DIR "/cards.json"
 #define BUFFER_CARDS_TMP CONFIG_BUFFER_VELA_DATA_DIR "/cards.json.tmp"
 #define BUFFER_CARDS_JSON_SIZE (16 * 1024)
+
+/* The cache is keyed by public Fabric identity IDs, never by app device IDs or
+ * legacy phone.conf. A failed load stays false until an explicit invalidation. */
+static pthread_mutex_t g_oobe_completion_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_oobe_completion_io_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_oobe_completion_cache_valid;
+static bool g_oobe_completion_cache_value;
+static int g_oobe_completion_cache_result = -EAGAIN;
+static char g_oobe_completion_cache_local[65];
+static char g_oobe_completion_cache_peer[65];
 
 static int buffer_mkdir(const char *path)
 {
@@ -59,6 +78,17 @@ static int buffer_write_atomic(const char *temporary_path,
                                const char *data, size_t length)
 {
   FILE *file;
+
+  if (buffer_source_is_projection_path(final_path))
+    {
+      if (!data || !length || length > BUFFER_AGENT_JSON_BYTES || memchr(data, 0, length)) return -EINVAL;
+      char *raw = malloc(length + 1);
+      if (!raw) return -ENOMEM;
+      memcpy(raw, data, length); raw[length] = 0;
+      int result = buffer_source_projection_save(final_path, raw, NULL, NULL);
+      memset(raw, 0, length); free(raw);
+      return result;
+    }
 
   file = fopen(temporary_path, "w");
   if (file == NULL)
@@ -189,6 +219,10 @@ int buffer_store_init(void)
 {
   int ret;
 
+  ret=buffer_private_storage_prepare();if(ret)return ret;
+#ifdef CONFIG_BUFFER_VELA_SOURCE_JOURNAL
+  ret=buffer_source_events_init();if(ret)return ret;
+#endif
   ret = buffer_mkdir(CONFIG_BUFFER_VELA_DATA_DIR);
   if (ret < 0)
     {
@@ -345,32 +379,28 @@ int buffer_store_load_pairing_code(char *pairing_code,
                              BUFFER_PAIRING_CODE_FILE, pairing_code, 6);
 }
 
+static int buffer_read_projection_lines(const char *path, char **raw);
+
 int buffer_store_load_focus_interval(uint32_t *interval)
 {
-  char line[32];
+  char *raw = NULL;
   char extra;
   unsigned long value;
-  FILE *file;
-  int ret = -EINVAL;
 
   if (interval == NULL)
     {
       return -EINVAL;
     }
-  file = fopen(BUFFER_FOCUS_FILE, "r");
-  if (file == NULL)
-    {
-      return -errno;
-    }
-  if (fgets(line, sizeof(line), file) != NULL &&
-      sscanf(line, "%lu %c", &value, &extra) == 1 &&
+  int ret = buffer_read_projection_lines(BUFFER_FOCUS_FILE, &raw);
+  if (ret) return ret;
+  ret = -EINVAL;
+  if (sscanf(raw, "%lu %c", &value, &extra) == 1 &&
       value >= BUFFER_FOCUS_INTERVAL_MIN_MS &&
-      value <= BUFFER_FOCUS_INTERVAL_MAX_MS && fgetc(file) == EOF)
+      value <= BUFFER_FOCUS_INTERVAL_MAX_MS)
     {
       ret = 0;
     }
-  if (ferror(file)) ret = -EIO;
-  if (fclose(file) != 0) ret = -errno;
+  free(raw);
   if (ret == 0) *interval = (uint32_t)value;
   return ret;
 }
@@ -390,10 +420,283 @@ int buffer_store_save_focus_interval(uint32_t interval)
                               line, (size_t)length);
 }
 
+int buffer_store_load_oobe_deferred(bool *deferred)
+{
+  char line[16];
+  FILE *file;
+  int ret = -EINVAL;
+
+  if (deferred == NULL)
+    {
+      return -EINVAL;
+    }
+
+  *deferred = false;
+  file = fopen(BUFFER_OOBE_STATE_FILE, "r");
+  if (file == NULL)
+    {
+      return -errno;
+    }
+
+  if (fgets(line, sizeof(line), file) != NULL && fgetc(file) == EOF)
+    {
+      if (strcmp(line, "deferred=1\n") == 0)
+        {
+          *deferred = true;
+          ret = 0;
+        }
+      else if (strcmp(line, "deferred=0\n") == 0)
+        {
+          ret = 0;
+        }
+    }
+
+  if (ferror(file)) ret = -EIO;
+  if (fclose(file) != 0 && ret == 0) ret = -errno;
+  if (ret < 0) *deferred = false;
+  return ret;
+}
+
+int buffer_store_save_oobe_deferred(bool deferred)
+{
+  const char *line = deferred ? "deferred=1\n" : "deferred=0\n";
+  return buffer_write_atomic(BUFFER_OOBE_STATE_TMP, BUFFER_OOBE_STATE_FILE,
+                             line, strlen(line));
+}
+
+static bool buffer_store_valid_fabric_id(const char *id)
+{
+  if (id == NULL || strlen(id) != 64) return false;
+  for (size_t i = 0; i < 64; i++)
+    if (!((id[i] >= '0' && id[i] <= '9') ||
+          (id[i] >= 'a' && id[i] <= 'f'))) return false;
+  return true;
+}
+
+static int buffer_store_current_fabric_pair(char local_id[65], char peer_id[65])
+{
+  local_id[0] = peer_id[0] = '\0';
+  int ret = buffer_fabric_identity_pair(local_id, peer_id);
+  if (ret < 0) return ret;
+  if (!buffer_store_valid_fabric_id(local_id) ||
+      !buffer_store_valid_fabric_id(peer_id))
+    {
+      local_id[0] = peer_id[0] = '\0';
+      return -EACCES;
+    }
+  return 0;
+}
+
+static int buffer_store_oobe_read_line(const char **cursor,
+                                       const char *field, char *value,
+                                       size_t value_size)
+{
+  const char *start;
+  const char *end;
+  size_t field_size = strlen(field);
+  size_t length;
+
+  if (strncmp(*cursor, field, field_size) != 0) return -EINVAL;
+  start = *cursor + field_size;
+  end = strchr(start, '\n');
+  if (end == NULL) return -EINVAL;
+  length = (size_t)(end - start);
+  if (length == 0 || length >= value_size) return -EINVAL;
+  memcpy(value, start, length);
+  value[length] = '\0';
+  *cursor = end + 1;
+  return 0;
+}
+
+int buffer_store_load_oobe_completed(bool *completed)
+{
+  char local_id[65];
+  char peer_id[65];
+  char record_local[65];
+  char record_peer[65];
+  char version[8];
+  char complete_text[2];
+  char content[256];
+  const char *cursor;
+  FILE *file;
+  size_t length;
+  bool value = false;
+  int ret;
+
+  if (completed == NULL) return -EINVAL;
+  *completed = false;
+  ret = buffer_store_current_fabric_pair(local_id, peer_id);
+  if (ret < 0)
+    {
+      buffer_store_oobe_completion_invalidate();
+      return ret;
+    }
+
+  /* Serialize disk refreshes separately. The fast cached query never waits
+   * behind LittleFS I/O. */
+  pthread_mutex_lock(&g_oobe_completion_io_lock);
+  pthread_mutex_lock(&g_oobe_completion_lock);
+  if (g_oobe_completion_cache_valid &&
+      !strcmp(local_id, g_oobe_completion_cache_local) &&
+      !strcmp(peer_id, g_oobe_completion_cache_peer))
+    {
+      *completed = g_oobe_completion_cache_value;
+      ret = g_oobe_completion_cache_result;
+      pthread_mutex_unlock(&g_oobe_completion_lock);
+      pthread_mutex_unlock(&g_oobe_completion_io_lock);
+      return ret;
+    }
+  pthread_mutex_unlock(&g_oobe_completion_lock);
+
+  file = fopen(BUFFER_OOBE_COMPLETION_FILE, "r");
+  if (file == NULL)
+    {
+      ret = -errno;
+      goto cache_result;
+    }
+  length = fread(content, 1, sizeof(content) - 1, file);
+  if (ferror(file)) ret = -EIO;
+  else if (length == sizeof(content) - 1) ret = -EFBIG;
+  else ret = 0;
+  if (fclose(file) != 0 && ret == 0) ret = -errno;
+  if (ret < 0) goto cache_result;
+  content[length] = '\0';
+
+  cursor = content;
+  ret = buffer_store_oobe_read_line(&cursor, "version=", version,
+                                    sizeof(version));
+  if (!ret && strcmp(version, "1")) ret = -EINVAL;
+  if (!ret) ret = buffer_store_oobe_read_line(&cursor, "local_fabric_id=",
+                                               record_local,
+                                               sizeof(record_local));
+  if (!ret) ret = buffer_store_oobe_read_line(&cursor, "peer_fabric_id=",
+                                               record_peer,
+                                               sizeof(record_peer));
+  if (!ret) ret = buffer_store_oobe_read_line(&cursor, "completed=",
+                                               complete_text,
+                                               sizeof(complete_text));
+  if (!ret && (*cursor != '\0' ||
+               !buffer_store_valid_fabric_id(record_local) ||
+               !buffer_store_valid_fabric_id(record_peer) ||
+               (strcmp(complete_text, "0") && strcmp(complete_text, "1"))))
+    ret = -EINVAL;
+  if (!ret && (strcmp(record_local, local_id) ||
+               strcmp(record_peer, peer_id)))
+    {
+      /* A valid record for another Fabric binding is simply incomplete for
+       * this identity; it must never carry completion across re-pairing. */
+      value = false;
+    }
+  else if (!ret) value = strcmp(complete_text, "1") == 0;
+
+cache_result:
+  pthread_mutex_lock(&g_oobe_completion_lock);
+  g_oobe_completion_cache_valid = true;
+  g_oobe_completion_cache_value = ret == 0 && value;
+  g_oobe_completion_cache_result = ret;
+  snprintf(g_oobe_completion_cache_local,
+           sizeof(g_oobe_completion_cache_local), "%s", local_id);
+  snprintf(g_oobe_completion_cache_peer,
+           sizeof(g_oobe_completion_cache_peer), "%s", peer_id);
+  *completed = ret == 0 && value;
+  pthread_mutex_unlock(&g_oobe_completion_lock);
+  pthread_mutex_unlock(&g_oobe_completion_io_lock);
+  return ret;
+}
+
+int buffer_store_save_oobe_completed(bool completed)
+{
+  char local_id[65];
+  char peer_id[65];
+  char content[192];
+  int length;
+  int ret = buffer_store_current_fabric_pair(local_id, peer_id);
+  if (ret < 0)
+    {
+      buffer_store_oobe_completion_invalidate();
+      return ret;
+    }
+
+  length = snprintf(content, sizeof(content),
+      "version=1\nlocal_fabric_id=%s\npeer_fabric_id=%s\ncompleted=%d\n",
+      local_id, peer_id, completed ? 1 : 0);
+  if (length < 0 || (size_t)length >= sizeof(content)) return -EOVERFLOW;
+  pthread_mutex_lock(&g_oobe_completion_io_lock);
+  ret = buffer_write_atomic(BUFFER_OOBE_COMPLETION_TMP,
+                            BUFFER_OOBE_COMPLETION_FILE,
+                            content, (size_t)length);
+  pthread_mutex_lock(&g_oobe_completion_lock);
+  g_oobe_completion_cache_valid = true;
+  g_oobe_completion_cache_value = ret == 0 && completed;
+  g_oobe_completion_cache_result = ret;
+  snprintf(g_oobe_completion_cache_local,
+           sizeof(g_oobe_completion_cache_local), "%s", local_id);
+  snprintf(g_oobe_completion_cache_peer,
+           sizeof(g_oobe_completion_cache_peer), "%s", peer_id);
+  pthread_mutex_unlock(&g_oobe_completion_lock);
+  pthread_mutex_unlock(&g_oobe_completion_io_lock);
+  return ret;
+}
+
+bool buffer_store_oobe_completed_cached(void)
+{
+  char local_id[65];
+  char peer_id[65];
+  bool completed;
+  if (buffer_store_current_fabric_pair(local_id, peer_id) < 0)
+    {
+      buffer_store_oobe_completion_invalidate();
+      return false;
+    }
+
+  pthread_mutex_lock(&g_oobe_completion_lock);
+  completed = g_oobe_completion_cache_valid &&
+      g_oobe_completion_cache_result == 0 &&
+      g_oobe_completion_cache_value &&
+      !strcmp(local_id, g_oobe_completion_cache_local) &&
+      !strcmp(peer_id, g_oobe_completion_cache_peer);
+  pthread_mutex_unlock(&g_oobe_completion_lock);
+  return completed;
+}
+
+void buffer_store_oobe_completion_invalidate(void)
+{
+  pthread_mutex_lock(&g_oobe_completion_lock);
+  g_oobe_completion_cache_valid = false;
+  g_oobe_completion_cache_value = false;
+  g_oobe_completion_cache_result = -EAGAIN;
+  g_oobe_completion_cache_local[0] = '\0';
+  g_oobe_completion_cache_peer[0] = '\0';
+  pthread_mutex_unlock(&g_oobe_completion_lock);
+}
+
+/* Read a committed snapshot under the journal mutex. Plain legacy profiles
+ * retain their filesystem reader and do not acquire private-storage claims. */
+static int buffer_read_projection_lines(const char *path, char **raw)
+{
+  *raw = NULL;
+  if (buffer_source_is_projection_path(path))
+    {
+      size_t length = 0;
+      return buffer_source_projection_read_bytes(path, 4096, raw, &length);
+    }
+  FILE *file = fopen(path, "r");
+  if (!file) return -errno;
+  char *text = calloc(1, 4097);
+  if (!text) { fclose(file); return -ENOMEM; }
+  size_t length = fread(text, 1, 4096, file);
+  int ret = ferror(file) ? -EIO : 0;
+  if (!ret && fgetc(file) != EOF) ret = -EFBIG;
+  if (ferror(file) && !ret) ret = -EIO;
+  if (fclose(file) && !ret) ret = -errno;
+  if (!ret && memchr(text, 0, length)) ret = -EINVAL;
+  if (ret) free(text); else *raw = text;
+  return ret;
+}
+
 int buffer_store_load_mode(char *mode, size_t mode_size)
 {
-  FILE *file;
-  char line[64];
+  char *raw = NULL, *line, *cursor;
 
   if (mode == NULL || mode_size == 0)
     {
@@ -401,13 +704,10 @@ int buffer_store_load_mode(char *mode, size_t mode_size)
     }
 
   snprintf(mode, mode_size, "normal");
-  file = fopen(BUFFER_MODE_FILE, "r");
-  if (file == NULL)
-    {
-      return errno == ENOENT ? -ENOENT : -errno;
-    }
+  int ready = buffer_read_projection_lines(BUFFER_MODE_FILE, &raw);
+  if (ready) return ready;
 
-  while (fgets(line, sizeof(line), file) != NULL)
+  for (line = strtok_r(raw, "\n", &cursor); line; line = strtok_r(NULL, "\n", &cursor))
     {
       line[strcspn(line, "\r\n")] = '\0';
       if (strncmp(line, "mode=", 5) == 0)
@@ -422,7 +722,7 @@ int buffer_store_load_mode(char *mode, size_t mode_size)
         }
     }
 
-  fclose(file);
+  free(raw);
   return 0;
 }
 
@@ -494,9 +794,7 @@ int buffer_store_load_pending_action(char *card_id, size_t card_id_size,
                                      char *action_id, size_t action_id_size,
                                      char *action, size_t action_size)
 {
-  FILE *file;
-  char line[BUFFER_ID_SIZE + BUFFER_ACTION_ID_SIZE +
-            BUFFER_ACTION_SIZE + 32];
+  char *raw = NULL, *line, *cursor;
   int ret;
 
   if (card_id == NULL || card_id_size == 0 || action == NULL ||
@@ -508,13 +806,10 @@ int buffer_store_load_pending_action(char *card_id, size_t card_id_size,
   card_id[0] = '\0';
   action_id[0] = '\0';
   action[0] = '\0';
-  file = fopen(BUFFER_PENDING_ACTION_FILE, "r");
-  if (file == NULL)
-    {
-      return -errno;
-    }
+  ret = buffer_read_projection_lines(BUFFER_PENDING_ACTION_FILE, &raw);
+  if (ret) return ret;
 
-  while (fgets(line, sizeof(line), file) != NULL)
+  for (line = strtok_r(raw, "\n", &cursor); line; line = strtok_r(NULL, "\n", &cursor))
     {
       line[strcspn(line, "\r\n")] = '\0';
       if (strncmp(line, "card_id=", 8) == 0)
@@ -531,7 +826,7 @@ int buffer_store_load_pending_action(char *card_id, size_t card_id_size,
         }
     }
 
-  fclose(file);
+  free(raw);
   if (card_id[0] == '\0' || action[0] == '\0')
     {
       return -EINVAL;
@@ -554,10 +849,16 @@ int buffer_store_load_pending_action(char *card_id, size_t card_id_size,
   return 0;
 }
 
-void buffer_store_clear_pending_action(void)
+int buffer_store_clear_pending_action(void)
 {
-  unlink(BUFFER_PENDING_ACTION_FILE);
-  unlink(BUFFER_PENDING_ACTION_TMP);
+  if (buffer_source_is_projection_path(BUFFER_PENDING_ACTION_FILE))
+    {
+      int ret = buffer_source_projection_remove(BUFFER_PENDING_ACTION_FILE, "CardActionRequestCleared");
+      if (ret) return ret;
+      return unlink(BUFFER_PENDING_ACTION_TMP) && errno != ENOENT ? -errno : 0;
+    }
+  if (unlink(BUFFER_PENDING_ACTION_TMP) && errno != ENOENT) return -errno;
+  return unlink(BUFFER_PENDING_ACTION_FILE) && errno != ENOENT ? -errno : 0;
 }
 
 int buffer_store_save_pending_mode(const char *mode, const char *mode_id)
@@ -584,8 +885,7 @@ int buffer_store_save_pending_mode(const char *mode, const char *mode_id)
 int buffer_store_load_pending_mode(char *mode, size_t mode_size,
                                    char *mode_id, size_t mode_id_size)
 {
-  FILE *file;
-  char line[BUFFER_MODE_SIZE + BUFFER_ACTION_ID_SIZE + 24];
+  char *raw = NULL, *line, *cursor;
   int ret;
 
   if (mode == NULL || mode_size == 0 || mode_id == NULL || mode_id_size == 0)
@@ -595,13 +895,10 @@ int buffer_store_load_pending_mode(char *mode, size_t mode_size,
 
   mode[0] = '\0';
   mode_id[0] = '\0';
-  file = fopen(BUFFER_PENDING_MODE_FILE, "r");
-  if (file == NULL)
-    {
-      return -errno;
-    }
+  ret = buffer_read_projection_lines(BUFFER_PENDING_MODE_FILE, &raw);
+  if (ret) return ret;
 
-  while (fgets(line, sizeof(line), file) != NULL)
+  for (line = strtok_r(raw, "\n", &cursor); line; line = strtok_r(NULL, "\n", &cursor))
     {
       line[strcspn(line, "\r\n")] = '\0';
       if (strncmp(line, "mode=", 5) == 0)
@@ -620,7 +917,7 @@ int buffer_store_load_pending_mode(char *mode, size_t mode_size,
         }
     }
 
-  fclose(file);
+  free(raw);
   if (mode[0] == '\0')
     {
       return -EINVAL;
@@ -642,10 +939,25 @@ int buffer_store_load_pending_mode(char *mode, size_t mode_size,
   return 0;
 }
 
-void buffer_store_clear_pending_mode(void)
+int buffer_store_clear_pending_mode(void)
 {
-  unlink(BUFFER_PENDING_MODE_FILE);
-  unlink(BUFFER_PENDING_MODE_TMP);
+  if (buffer_source_is_projection_path(BUFFER_PENDING_MODE_FILE))
+    {
+      int ret = buffer_source_projection_remove(BUFFER_PENDING_MODE_FILE, "ModeChangeRequestCleared");
+      if (ret) return ret;
+      return unlink(BUFFER_PENDING_MODE_TMP) && errno != ENOENT ? -errno : 0;
+    }
+  if (unlink(BUFFER_PENDING_MODE_TMP) < 0 && errno != ENOENT)
+    {
+      return -errno;
+    }
+
+  if (unlink(BUFFER_PENDING_MODE_FILE) < 0 && errno != ENOENT)
+    {
+      return -errno;
+    }
+
+  return 0;
 }
 
 static void buffer_store_copy_json_string(char *destination, size_t size,
@@ -881,6 +1193,10 @@ int buffer_store_load_cards(struct buffer_card_s *cards, int max_cards)
                                     sizeof(cards[count].state), item, "state");
       buffer_store_copy_json_actions(cards[count].actions,
                                      sizeof(cards[count].actions), item);
+      buffer_deck_metadata(&cards[count],item);
+      cJSON *revision = cJSON_GetObjectItemCaseSensitive(item, "content_revision");
+      cards[count].content_revision = cJSON_IsNumber(revision) && revision->valuedouble >= 0 &&
+          revision->valuedouble <= 9007199254740991.0 ? (uint64_t)revision->valuedouble : 0;
       created = cJSON_GetObjectItemCaseSensitive(item, "created_at");
       cards[count].created_at = created != NULL && cJSON_IsNumber(created)
                                   ? (int64_t)created->valuedouble : 0;
@@ -935,6 +1251,7 @@ int buffer_store_save_cards(const struct buffer_card_s *cards, int count)
       cJSON_AddStringToObject(item, "title", cards[index].title);
       cJSON_AddStringToObject(item, "summary", cards[index].summary);
       cJSON_AddStringToObject(item, "answer", cards[index].answer);
+      cJSON_AddNumberToObject(item, "content_revision", (double)cards[index].content_revision);
       cJSON_AddStringToObject(item, "state", cards[index].state);
       ret = buffer_store_add_json_actions(item, cards[index].actions);
       if (ret < 0)
@@ -945,6 +1262,23 @@ int buffer_store_save_cards(const struct buffer_card_s *cards, int count)
         }
       cJSON_AddNumberToObject(item, "created_at",
                               (double)cards[index].created_at);
+      cJSON *schedule=cJSON_CreateObject();
+      cJSON *display=cJSON_CreateObject();
+      if (!schedule || !display)
+        {
+          cJSON_Delete(schedule);cJSON_Delete(display);
+          cJSON_Delete(item);cJSON_Delete(root);return -ENOMEM;
+        }
+      cJSON_AddNumberToObject(schedule,"start",(double)cards[index].schedule_start);
+      cJSON_AddNumberToObject(schedule,"end",(double)cards[index].schedule_end);
+      cJSON_AddItemToObject(item,"schedule",schedule);
+      cJSON_AddNumberToObject(display,"hidden_until",(double)cards[index].hidden_until);
+      cJSON_AddNumberToObject(display,"returned_at",(double)cards[index].returned_at);
+      cJSON_AddItemToObject(item,"display_return",display);
+      cJSON_AddBoolToObject(item,"bedtime_readable",cards[index].bedtime_readable);
+      char fingerprint[65];
+      if (!buffer_deck_fingerprint(item,fingerprint)) {cJSON_Delete(item);cJSON_Delete(root);return -EIO;}
+      cJSON_AddStringToObject(item,"bedtime_fingerprint",fingerprint);
       cJSON_AddItemToArray(root, item);
     }
 
@@ -1051,6 +1385,11 @@ int buffer_store_read_audio(const char *capture_id,
     {
       return -EINVAL;
     }
+
+  /* ASR and phone delegation must not consume a capture whose original
+   * descriptor/blob archive has not reached the source journal yet. */
+  ret = buffer_source_capture_ensure(capture_id);
+  if (ret < 0) return ret;
 
   ret = buffer_path(path, sizeof(path), capture_id, ".wav");
   if (ret < 0 || stat(path, &st) < 0)
@@ -1356,6 +1695,14 @@ int buffer_store_ack(const char *capture_id)
       return -EINVAL;
     }
 
+  char wav[256];
+  int preserved=buffer_path(wav,sizeof(wav),capture_id,".wav");
+  if(preserved<0)return preserved;
+  if(access(wav,F_OK)==0){
+    preserved=buffer_source_capture_ensure(capture_id);
+    if(preserved<0)return preserved;
+  }else if(errno!=ENOENT)return -errno;
+
   for (index = 0; index < sizeof(suffixes) / sizeof(suffixes[0]); index++)
     {
       int ret = buffer_store_unlink_capture_file(capture_id, suffixes[index]);
@@ -1468,4 +1815,108 @@ int buffer_store_save_pairing(const char *host, const char *token,
   ret = buffer_store_write_pairing(host, token, phone_device_id, request_id);
   pthread_mutex_unlock(&g_pairing_store_lock);
   return ret;
+}
+
+int buffer_store_capture_target(const char *capture_id, char *target,
+                                size_t target_size)
+{
+  char path[256];
+  char line[128];
+  FILE *file;
+  bool target_seen = false;
+  int ret;
+
+  if (target == NULL || target_size == 0 ||
+      !buffer_store_valid_device_id(capture_id))
+    {
+      return -EINVAL;
+    }
+  target[0] = '\0';
+
+  ret = buffer_path(path, sizeof(path), capture_id, ".meta");
+  if (ret < 0)
+    {
+      return ret;
+    }
+
+  file = fopen(path, "r");
+  if (file == NULL)
+    {
+      return -errno;
+    }
+
+  while (fgets(line, sizeof(line), file) != NULL)
+    {
+      if (strchr(line, '\n') == NULL && !feof(file))
+        {
+          ret = -EINVAL;
+          goto out;
+        }
+
+      line[strcspn(line, "\r\n")] = '\0';
+      if (strncmp(line, "target=", 7) == 0)
+        {
+          if (target_seen)
+            {
+              ret = -EINVAL;
+              goto out;
+            }
+
+          if (strcmp(line + 7, "assistant") == 0 ||
+              strcmp(line + 7, "buffer") == 0 ||
+              strcmp(line + 7, "auto") == 0)
+            {
+              if (strlen(line + 7) >= target_size)
+                {
+                  ret = -ENAMETOOLONG;
+                  goto out;
+                }
+              snprintf(target, target_size, "%s", line + 7);
+            }
+          else
+            {
+              ret = -EINVAL;
+              goto out;
+            }
+
+          target_seen = true;
+        }
+    }
+
+  if (ferror(file))
+    {
+      ret = -EIO;
+    }
+  else if (!target_seen)
+    {
+      /* Older queued captures predate target metadata and belong to Buffer. */
+      if (sizeof("buffer") > target_size)
+        ret = -ENAMETOOLONG;
+      else
+        {
+          snprintf(target, target_size, "buffer");
+          ret = 0;
+        }
+    }
+  else
+    {
+      ret = 0;
+    }
+
+out:
+  if (fclose(file) != 0 && ret >= 0)
+    {
+      ret = -EIO;
+    }
+  if (ret < 0) target[0] = '\0';
+
+  return ret;
+}
+
+int buffer_store_capture_is_assistant(const char *capture_id)
+{
+  char target[BUFFER_CAPTURE_TARGET_NAME_SIZE];
+  int ret = buffer_store_capture_target(capture_id, target, sizeof(target));
+  if (ret < 0) return ret;
+  return strcmp(target, "assistant") == 0 ? 1 : 0;
 }

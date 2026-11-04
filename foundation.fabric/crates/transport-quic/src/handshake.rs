@@ -35,7 +35,11 @@ impl Default for LinkHandshakeConfig {
     fn default() -> Self {
         Self {
             supported_protocol_versions: vec![DEFAULT_PROTOCOL_VERSION],
-            features: vec!["quic".into(), "registry-sync".into()],
+            features: vec![
+                "quic".into(),
+                "registry-sync".into(),
+                fabric_protocol::COORDINATOR_ELECTION_FEATURE.into(),
+            ],
             link_generation: 1,
         }
     }

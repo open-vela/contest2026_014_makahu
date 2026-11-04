@@ -22,7 +22,7 @@ internal fun BufferRhythmPanel(mode: String, onModeChanged: (String) -> Unit, on
     ) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("现在的节奏", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+                Text("模式", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
                 IconButton(onClick = onSettings, modifier = Modifier.size(48.dp)) {
                     Icon(BufferIcons.Settings, contentDescription = "专注提醒设置",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
@@ -40,12 +40,6 @@ internal fun BufferRhythmPanel(mode: String, onModeChanged: (String) -> Unit, on
                     )
                 }
             }
-            Text(when (mode) {
-                "focus" -> "安心投入，也给休息留一点时间。"
-                "bedtime" -> "通知暂缓，给今晚留一点安静。"
-                "rabbit_hole" -> "留住探索的过程，慢慢靠近答案。"
-                else -> "不赶进度，按自己的节奏来。"
-            }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -65,20 +59,19 @@ internal fun BufferExplorationPanel(
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Icon(BufferIcons.Search, null, tint = MaterialTheme.colorScheme.onSecondaryContainer)
-                Text(if (session?.active == true) "正在探索" else "给好奇心一点时间", style = MaterialTheme.typography.titleMedium)
+                Text(if (session?.active == true) "正在探索" else "探索", style = MaterialTheme.typography.titleMedium)
             }
             if (session?.active == true) {
                 Text(session.title, style = MaterialTheme.typography.bodyLarge)
                 Text("剩余 ${session.remainingMinutes(now)} 分钟", style = MaterialTheme.typography.labelLarge)
             } else {
-                Text("从一个收藏出发，继续上次的想法。", style = MaterialTheme.typography.bodyMedium)
                 if (session != null) Text("上次探索：${session.title}", style = MaterialTheme.typography.bodySmall)
             }
             Button(onClick = onResearch, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-                Text(if (session?.active == true) "结束并留下记录" else "开始探索")
+                Text(if (session?.active == true) "结束并记录" else "开始探索")
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                TextButton(onClick = onHistory) { Text("过去的探索") }
+                TextButton(onClick = onHistory) { Text("探索历史") }
                 if (session != null && !session.active) TextButton(onClick = onRecord) { Text("补充记录") }
             }
         }

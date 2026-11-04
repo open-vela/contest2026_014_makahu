@@ -75,7 +75,24 @@ CREATE TABLE peer_registry_revisions (
     local_sent_revision INTEGER NOT NULL,
     remote_applied_revision INTEGER NOT NULL
 );
+
+CREATE TABLE coordinator_elections (
+    session_id BLOB PRIMARY KEY,
+    membership_hash BLOB NOT NULL,
+    term INTEGER NOT NULL,
+    voted_for BLOB,
+    committed_epoch INTEGER NOT NULL,
+    committed_plan_hash BLOB NOT NULL
+);
 ```
+
+`fabric-storage::SqliteElectionStore` 以事务更新 election term、单轮投票和已提交 plan 指纹；
+`fabric-session::SessionCommand::Persist` 将 coordinator participant 与 election term 一并交给
+持久化执行者。
+投票签名只能在 vote transaction 成功提交后生成。成员集合 hash 不匹配时拒绝沿用旧 election
+记录；首阶段不允许隐式改变成员集合。应用启动恢复时应先核对 Session 记录和 election row 的
+`session_id`、membership hash、epoch、plan hash；任何缺失或不一致都需要挂起并显式修复，不能
+通过重新初始化覆盖旧 vote。
 
 ## 3. 不持久化内容
 
@@ -110,11 +127,18 @@ Hub 启动顺序：
 
 - Offer upsert + registry revision 递增；
 - Requirement update + revision；
-- Session epoch commit + plan snapshot；
+- Session epoch commit + plan snapshot + coordinator election committed-plan 指纹；
 - Policy update + snapshot revision；
 - 信任状态改变 + revoke 相关 grant。
 
 网络发送在事务提交后进行，采用 outbox 或可重建 delta，避免“已发送但未落库”不一致。
+`initialize_session_checkpoint`、`commit_session_checkpoint` 提供 Session snapshot 与 election
+committed-plan 指纹的同事务写入；后者校验证书、term、旧计划 CAS 和固定成员边界，回滚点测试
+在 snapshot 写入后注入失败，并经过三次重新打开验证两处均未推进。重复提交幂等。
+`load_session_checkpoint` 拒绝旧双写路径产生的 torn epoch/hash；一致快照也不代表当前 leader
+授权或可自动 Active，恢复始终先 Suspended，重新证明授权和 app 接纳。
+这些 checkpoint API 已有针对性测试，但 Hub 网络选举/恢复执行者仍需接入；vote transaction
+仍在签名前独立持久化，不能以存在原子 API 代替实际运行时接线。
 
 ## 6. 租约清理
 

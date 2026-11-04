@@ -1,0 +1,51 @@
+diff --git a/boards/r528/r528s3-gemini-s1/src/Makefile b/boards/r528/r528s3-gemini-s1/src/Makefile
+--- a/boards/r528/r528s3-gemini-s1/src/Makefile
++++ b/boards/r528/r528s3-gemini-s1/src/Makefile
+@@ -362,6 +362,15 @@
+ include $(TOPDIR)/boards/Board.mk
+ endif
+ 
++ifeq ($(CONFIG_ETC_ROMFS),y)
++# Reprocess startup scripts when enabled services or their included script
++# change; otherwise an incremental image can retain the old service list.
++etctmp/etc/init.d/rc.sysinit etctmp/etc/init.d/rcS: $(TOPDIR)/include/nuttx/config.h
++ifeq ($(CONFIG_GEMINI_S1_NSH),y)
++etctmp/etc/init.d/rcS: etc/init.d/rcS.nsh
++endif
++endif
++
+ ifeq ($(CONFIG_ALLWINNER_BINARY_ONLY),y)
+ EXTRA_LIBPATHS += -L$(TOPDIR)/../vendor/allwinnertech/libs/drivers/r528
+ EXTRA_LIBS     += -ldrivers_r528
+diff --git a/boards/r528/r528s3-gemini-s1/src/etc/init.d/rc.sysinit b/boards/r528/r528s3-gemini-s1/src/etc/init.d/rc.sysinit
+--- a/boards/r528/r528s3-gemini-s1/src/etc/init.d/rc.sysinit
++++ b/boards/r528/r528s3-gemini-s1/src/etc/init.d/rc.sysinit
+@@ -27,4 +27,9 @@
+ mount -t tmpfs /tmp
+ #endif
+ 
++#ifdef CONFIG_NET_LOCAL
++/* Local stream sockets create their IPC FIFOs in this directory. */
++mkdir -p CONFIG_NET_LOCAL_VFS_PATH
++#endif
++
+ set TZ Asia/Shanghai
+diff --git a/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig b/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig
+--- a/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig
++++ b/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig
+@@ -311,6 +311,9 @@
+ CONFIG_IOEXPANDER=y
+ CONFIG_IRQ_WORK_STACKSIZE=4096
+ CONFIG_KVDB=y
++CONFIG_KVDB_SERVER=y
++CONFIG_KVDB_STACKSIZE=8192
++CONFIG_KVDB_TEMPORARY_STORAGE=y
+ CONFIG_LCD=y
+ CONFIG_LCD_DEV=y
+ CONFIG_LCD_EXTERNINIT=y
+@@ -630,3 +633,5 @@
+ CONFIG_BUFFER_VELA_BLE=y
+ CONFIG_BUFFER_VELA_FABRIC=y
+ CONFIG_AUDIOUTILS_ALSA_LIB=y
++
++CONFIG_BLUETOOTH_HCI_RECV_STACKSIZE=8192

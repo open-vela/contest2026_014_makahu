@@ -1,0 +1,62 @@
+diff --git a/fs/littlefs/lfs_getpath.patch b/fs/littlefs/lfs_getpath.patch
+index 57be37a73a2..e596cca9801 100644
+--- a/fs/littlefs/lfs_getpath.patch
++++ b/fs/littlefs/lfs_getpath.patch
+@@ -20,7 +20,7 @@ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+  #ifndef LFS_READONLY
+  static int lfs_dir_commit(lfs_t *lfs, lfs_mdir_t *dir,
+          const struct lfs_mattr *attrs, int attrcount);
+-@@ -3790,6 +3792,53 @@ static lfs_soff_t lfs_file_rawsize(lfs_t *lfs, lfs_file_t *file) {
++@@ -3790,6 +3792,66 @@ static lfs_soff_t lfs_file_rawsize(lfs_t *lfs, lfs_file_t *file) {
+      return file->ctz.size;
+  }
+  
+@@ -33,8 +33,20 @@ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+ +    lfs_stag_t tag;
+ +    int err;
+ +
+-+    if (lfs_pair_cmp(lfs->root, dir->pair) != 0) {
+-+        tag = lfs_fs_parent(lfs, dir->pair, &parent);
+++    // A split directory's continuation pair has no parent name entry.
+++    // Locate its head before resolving the parent; keep the original pair
+++    // and id below to look up this file's own name.
+++    lfs_mdir_t head = *dir;
+++    while (lfs_pair_cmp(lfs->root, head.pair) != 0) {
+++        tag = lfs_fs_parent(lfs, head.pair, &parent);
+++        if (tag == LFS_ERR_NOENT) {
+++            lfs_mdir_t predecessor;
+++            err = lfs_fs_pred(lfs, head.pair, &predecessor);
+++            if (err) return err;
+++            if (!predecessor.split) return LFS_ERR_NOENT;
+++            head = predecessor;
+++            continue;
+++        }
+ +        if (tag < 0) {
+ +            return tag;
+ +        }
+@@ -46,6 +58,7 @@ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+ +
+ +        next += len;
+ +        size -= len;
+++        break;
+ +    }
+ +
+ +    err = lfs_dir_getinfo(lfs, dir, id, &info);
+@@ -74,7 +87,7 @@ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+  
+  /// General fs operations ///
+  static int lfs_rawstat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+-@@ -6042,6 +6091,22 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
++@@ -6042,6 +6104,22 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
+      return res;
+  }
+  
+@@ -97,7 +110,7 @@ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+  #ifndef LFS_READONLY
+  int lfs_mkdir(lfs_t *lfs, const char *path) {
+      int err = LFS_LOCK(lfs->cfg);
+-@@ -6173,6 +6238,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
++@@ -6173,6 +6251,20 @@ lfs_ssize_t lfs_fs_size(lfs_t *lfs) {
+      return res;
+  }
+  

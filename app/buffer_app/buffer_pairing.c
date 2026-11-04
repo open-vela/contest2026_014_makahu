@@ -7,6 +7,7 @@
 #include <nuttx/config.h>
 
 #include "buffer_app.h"
+#include "buffer_fabric.h"
 #include "buffer_ble_service.h"
 
 #include <arpa/inet.h>
@@ -729,8 +730,8 @@ void *buffer_pairing_thread_main(void *arg)
       return NULL;
     }
 
-  ret = pthread_create(&discovery_thread, NULL,
-                       buffer_discovery_thread_main, &discovery);
+  ret = buffer_thread_create(&discovery_thread,
+                             buffer_discovery_thread_main, &discovery);
   if (ret != 0)
     {
       pthread_mutex_destroy(&discovery.lock);
@@ -741,9 +742,16 @@ void *buffer_pairing_thread_main(void *arg)
     }
 
   buffer_pairing_snapshot(NULL, 0, pairing_code, sizeof(pairing_code));
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+  buffer_set_status("设备已启动，正在恢复连接");
+#else
   buffer_set_status("等待配对：输入屏幕上的配对码 %s", pairing_code);
+#endif
 
   ret = buffer_ble_start();
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+  buffer_fabric_report_error(ret);
+#endif
   if (ret < 0)
     {
       buffer_set_status("蓝牙发现不可用：%d", ret);
@@ -756,9 +764,18 @@ void *buffer_pairing_thread_main(void *arg)
     {
       buffer_ble_service_process();
       /* The Bluetooth service may become ready after Buffer at boot. */
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+      if (++ble_retry >= 5 || buffer_fabric_take_retry())
+#else
       if (++ble_retry >= 5)
+#endif
         {
-          (void)buffer_ble_start();
+          int ble_result = buffer_ble_start();
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+          buffer_fabric_report_error(ble_result);
+#else
+          (void)ble_result;
+#endif
           ble_retry = 0;
         }
       ret = poll(&ready, 1, 1000);

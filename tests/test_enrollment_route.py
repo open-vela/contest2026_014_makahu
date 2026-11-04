@@ -1,9 +1,10 @@
 """Exercise the production first-enrollment route with controlled discovery/storage."""
+from host_support import PROJECT_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root / 'app/buffer_app/buffer_wire.c').read_text()
 def extract(start, end):
     return source[source.index(start):source.index(end, source.index(start))]
@@ -83,6 +84,6 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix='buffer-enrollment-route-') as temporary:
     work = Path(temporary)
     (work / 'test.c').write_text(harness)
-    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(work / 'test.c'),
+    subprocess.run([*CC, '-Wall', '-Wextra', '-Werror', str(work / 'test.c'),
                     '-o', str(work / 'test')], check=True)
     subprocess.run([str(work / 'test')], check=True, timeout=5)

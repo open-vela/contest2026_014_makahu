@@ -15,12 +15,27 @@ config LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
 	depends on NETUTILS_NETINIT
 	depends on NETUTILS_DHCPC
 	depends on CRYPTO_MBEDTLS
+	depends on TLS_NELEM > 0
+	select LIB_JPEG_TURBO
+	select LV_USE_RLE
+	select LV_BIN_DECODER_RAM_LOAD
 	select AUDIOUTILS_ALSA_LIB
+	select SYSTEM_TIME64
 	---help---
 		Enable the Buffer capture, offline queue, LAN bridge and card shelf
 		for the Gemini-S1 Vela device.
+		Enable pthread TLS elements (TLS_NELEM, e.g. 8) so concurrent
+		assistant results retain their own capture identity.
 
 if LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
+
+config BUFFER_VELA_FONT_SCALE
+	int "Initial UI text scale (percent)"
+	range 85 200
+	default 100
+	---help---
+		Scale text sp independently of layout dp. Control center can change
+		the scale for the current UI session.
 
 config BUFFER_VELA_BLE
 	bool "Buffer BLE enrollment discovery"
@@ -29,14 +44,81 @@ config BUFFER_VELA_BLE
 	depends on BLUETOOTH_BLE_ADV
 	depends on BLUETOOTH_GATT_SERVER
 	depends on BT_SMP
+	select BLUETOOTH_IPC_JOIN_LOOP if BLUETOOTH_FRAMEWORK_SOCKET_IPC
+
+config BUFFER_VELA_SIM_PRIVATE_DISK
+	bool "Goldfish dedicated LittleFS disk on virtio bus 3"
+	default n
+	depends on ARCH_CHIP_GOLDFISH_ARM64 && FS_LITTLEFS && FS_LITTLEFS_ATTR_UPDATE
+	---help---
+		Mount the separately prepared third disk without formatting it. Preserve
+		the default FAT disk. Credentials fail closed if no private disk exists.
+
+config BUFFER_VELA_S1_PRIVATE_STORAGE
+	bool "Gemini-S1 dedicated NAND private storage"
+	default n
+	depends on ARCH_BOARD_R528S3_GEMINI_S1 && MTD && MTD_PARTITION
+	depends on !DISABLE_MOUNTPOINT
+	select MTD_DHARA
+	select FS_LITTLEFS
+	select FS_LITTLEFS_ATTR_UPDATE
+	---help---
+		Use the buffer-private factory partition layout. Restore Dhara on
+		/dev/bufpriv and mount LittleFS at /private before opening Buffer
+		storage. Normal startup never formats or falls back to FAT. This
+		layout moves usrdata and must not be installed as an in-place update.
+		Initialize only an erased dedicated partition with the local agent
+		storage-provision command before starting the application.
+
+config BUFFER_VELA_FABRIC
+	bool "Fabric authenticated BLE application messages"
+	default n
+	depends on BUFFER_VELA_BLE
+	---help---
+		Use the framework portable pairing/session host and canonical identity
+		backend. Requires a separately built no_std staticlib for this board's
+		architecture and floating-point calling convention.
+
+config BUFFER_VELA_FABRIC_ROOT
+	string "Fabric platform/portable override (empty uses bundled source)"
+	default ""
+	depends on BUFFER_VELA_FABRIC
+	---help---
+		Leave empty for the contest source snapshot. Framework developers may
+		set the independent repository here after building its board staticlib.
+
+config BUFFER_VELA_FABRIC_TARGET
+	string "Fabric Rust target triple"
+	default "aarch64-unknown-none" if ARCH_ARM64
+	default "armv7a-none-eabihf" if ARCH_ARMV7A && ARCH_FPU && !ARM_FPU_ABI_SOFT
+	default "armv7a-none-eabi" if ARCH_ARMV7A
+	default ""
+	depends on BUFFER_VELA_FABRIC
+	---help---
+		Select target/<triple>/release/libfabric_portable.a below the portable
+		root. S1 Cortex-A7 uses ARMv7-A; hard-float and soft-float archives
+		must match the NuttX C ABI. Other architectures need an explicit target.
 
 config BUFFER_VELA_DATA_DIR
 	string "Buffer Vela data directory"
+	default "/private/buffer" if BUFFER_VELA_S1_PRIVATE_STORAGE
 	default "/data/buffer"
 
 config BUFFER_VELA_PHONE_HOST
 	string "Default Buffer phone address"
 	default "192.168.1.100"
+
+config BUFFER_VELA_AGENT_CA_FILE
+	string "Managed Agent CA bundle override (empty uses embedded Mozilla roots)"
+	default ""
+	---help---
+		Build-time only. The HTTPS client always validates CA, hostname and
+		certificate dates. A missing override fails; no insecure fallback.
+
+config BUFFER_VELA_AGENT_HTTP_TIMEOUT_MS
+	int "Agent HTTPS total socket/TLS request deadline (ms)"
+	default 45000
+	range 1000 90000
 
 config BUFFER_VELA_PHONE_PORT
 	int "Buffer phone TCP port"
@@ -57,6 +139,22 @@ config BUFFER_VELA_PAIRING_PORT
 	default 48887
 	range 1024 65535
 
+config BUFFER_VELA_SOURCE_JOURNAL
+	bool "Immutable source events and audio archive"
+	default y if BUFFER_VELA_S1_PRIVATE_STORAGE
+	default y if BUFFER_VELA_SIM_PRIVATE_DISK
+	default n
+	depends on FS_LITTLEFS
+	depends on FS_LITTLEFS_ATTR_UPDATE
+	---help---
+		Persist source envelopes, recover interrupted record commits, and
+		archive audio before queue ACK. The data directory must be on private
+		LittleFS with file attributes. No storage is formatted automatically.
+		Enable explicitly after wiring a board's private storage; the existing
+		private simulator disk profile enables it by default.
+		Leave disabled on legacy FAT/HOSTFS profiles; they do not provide
+		the source-event replication capability.
+
 config BUFFER_VELA_MAX_RECORD_MS
 	int "Maximum press-to-talk recording length (ms)"
 	default 8000
@@ -76,5 +174,24 @@ config BUFFER_VELA_FOCUS_REMINDER_MS
 	int "Focus care reminder interval (ms)"
 	default 3000000
 	range 60000 86400000
+
+config BUFFER_VELA_NIGHT_DIM
+	bool "Sleep-mode LCD backlight levels (board must support real dimming)"
+	default n
+	depends on LCD_DEV && LCD_MAXPOWER > 1
+	---help---
+		Enable only for an LCD driver whose multi-level power API controls
+		backlight intensity. Binary framebuffer power is never used as brightness.
+
+config BUFFER_VELA_LCD_DEVICE
+	string "LCD device with verified brightness levels"
+	default "/dev/lcd0"
+	depends on BUFFER_VELA_NIGHT_DIM
+
+config BUFFER_VELA_NIGHT_PERCENT
+	int "Sleep brightness percent of the current level"
+	default 20
+	range 1 50
+	depends on BUFFER_VELA_NIGHT_DIM
 
 endif

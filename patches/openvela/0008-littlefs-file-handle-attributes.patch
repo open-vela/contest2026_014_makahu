@@ -1,0 +1,125 @@
+diff --git a/fs/littlefs/lfs_getpath.patch b/fs/littlefs/lfs_getpath.patch
+--- a/fs/littlefs/lfs_getpath.patch
++++ b/fs/littlefs/lfs_getpath.patch
+@@ -1,13 +1,13 @@
+ From 696dfa6ce29cb44d22e48bf66032e217383d8a2f Mon Sep 17 00:00:00 2001
+ From: zhouliang3 <zhouliang3@xiaomi.com>
+ Date: Tue, 24 Aug 2021 12:48:22 +0800
+-Subject: [PATCH] fs/littlefs: Add the function of obtaining absolute path
++Subject: [PATCH] fs/littlefs: Add file-handle path and attributes
+ 
+ Signed-off-by: zhouliang3 <zhouliang3@xiaomi.com>
+ ---
+- lfs.c | 79 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+- lfs.h |  8 ++++++
+- 2 files changed, 87 insertions(+)
++ lfs.c | 144 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
++ lfs.h | 22 ++++++++++++++++++++++
++ 2 files changed, 166 insertions(+)
+ 
+ --- ./littlefs/littlefs/lfs.c
+ +++ ./littlefs/littlefs/lfs.c
+@@ -87,7 +87,7 @@
+  
+  /// General fs operations ///
+  static int lfs_rawstat(lfs_t *lfs, const char *path, struct lfs_info *info) {
+-@@ -6042,6 +6104,22 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
++@@ -6042,6 +6104,74 @@ lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file) {
+      return res;
+  }
+  
+@@ -106,6 +106,58 @@
+ +    LFS_UNLOCK(lfs->cfg);
+ +    return err < 0 ? err : 0;
+ +}
+++
+++lfs_ssize_t lfs_file_getattr(lfs_t *lfs, lfs_file_t *file,
+++        uint8_t type, void *buffer, lfs_size_t size) {
+++    int err = LFS_LOCK(lfs->cfg);
+++    if (err) {
+++        return err;
+++    }
+++
+++    LFS_TRACE("lfs_file_getattr(%p, %p)", (void*)lfs, (void*)file);
+++    LFS_TRACE("lfs_file_getattr(%"PRIu8", %p, %"PRIu32")",
+++            type, buffer, size);
+++    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+++
+++    lfs_stag_t res = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x7ff, 0x3ff, 0),
+++            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+++                file->id, lfs_min(size, lfs->attr_max)), buffer);
+++    if (res == LFS_ERR_NOENT) {
+++        memset(buffer, 0, size);
+++        res = LFS_ERR_NOATTR;
+++    } else if (res >= 0) {
+++        res = (lfs_stag_t)lfs_tag_size((lfs_tag_t)res);
+++    }
+++
+++    LFS_TRACE("lfs_file_getattr -> %"PRId32, res);
+++    LFS_UNLOCK(lfs->cfg);
+++    return res;
+++}
+++
+++#ifndef LFS_READONLY
+++int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
+++        uint8_t type, const void *buffer, lfs_size_t size) {
+++    int err = LFS_LOCK(lfs->cfg);
+++    if (err) {
+++        return err;
+++    }
+++
+++    LFS_TRACE("lfs_file_setattr(%p, %p)", (void*)lfs, (void*)file);
+++    LFS_TRACE("lfs_file_setattr(%"PRIu8", %p, %"PRIu32")",
+++            type, buffer, size);
+++    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+++
+++    if (size > lfs->attr_max) {
+++        err = LFS_ERR_NOSPC;
+++    } else {
+++        err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
+++                {LFS_MKTAG(LFS_TYPE_USERATTR + type, file->id, size), buffer}));
+++    }
+++    LFS_TRACE("lfs_file_setattr -> %d", err);
+++    LFS_UNLOCK(lfs->cfg);
+++    return err;
+++}
+++#endif
+ +
+  #ifndef LFS_READONLY
+  int lfs_mkdir(lfs_t *lfs, const char *path) {
+@@ -133,7 +185,7 @@
+      if (err) {
+ --- ./littlefs/littlefs/lfs.h
+ +++ ./littlefs/littlefs/lfs.h
+-@@ -629,6 +629,10 @@ int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file);
++@@ -629,6 +629,25 @@ int lfs_file_rewind(lfs_t *lfs, lfs_file_t *file);
+  // Returns the size of the file, or a negative error code on failure.
+  lfs_soff_t lfs_file_size(lfs_t *lfs, lfs_file_t *file);
+  
+@@ -141,10 +193,25 @@
+ +//
+ +// Returns a negative error code on failure.
+ +int lfs_file_path(lfs_t *lfs, lfs_file_t *file, char *path, lfs_size_t size);
+++
+++// Get a custom attribute of an open file.
+++//
+++// Returns the stored attribute size, or a negative error code on failure.
+++// LFS_ERR_NOATTR is returned when the attribute is absent.
+++lfs_ssize_t lfs_file_getattr(lfs_t *lfs, lfs_file_t *file,
+++        uint8_t type, void *buffer, lfs_size_t size);
+++
+++// Set a custom attribute on an open file.
+++//
+++// Returns a negative error code on failure.
+++#ifndef LFS_READONLY
+++int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
+++        uint8_t type, const void *buffer, lfs_size_t size);
+++#endif
+  
+  /// Directory operations ///
+  
+-@@ -679,6 +683,10 @@ lfs_soff_t lfs_dir_tell(lfs_t *lfs, lfs_dir_t *dir);
++@@ -679,6 +698,10 @@ lfs_soff_t lfs_dir_tell(lfs_t *lfs, lfs_dir_t *dir);
+  // Returns a negative error code on failure.
+  int lfs_dir_rewind(lfs_t *lfs, lfs_dir_t *dir);
+  

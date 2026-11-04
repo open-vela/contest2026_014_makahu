@@ -1,0 +1,72 @@
+diff --git a/lfs.c b/lfs.c
+--- a/lfs.c
++++ b/lfs.c
+@@ -6128,31 +6128,48 @@
+     if (err) {
+         return err;
+     }
++    LFS_TRACE("lfs_file_getattr(%p, %p)", (void*)lfs, (void*)file);
++    LFS_TRACE("lfs_file_getattr(%"PRIu8", %p, %"PRIu32")",
++            type, buffer, size);
++    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
++
++    lfs_stag_t res = lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x7ff, 0x3ff, 0),
++            LFS_MKTAG(LFS_TYPE_USERATTR + type,
++                file->id, lfs_min(size, lfs->attr_max)), buffer);
++    if (res == LFS_ERR_NOENT) {
++        memset(buffer, 0, size);
++        res = LFS_ERR_NOATTR;
++    } else if (res >= 0) {
++        res = (lfs_stag_t)lfs_tag_size((lfs_tag_t)res);
++    }
++
++    LFS_TRACE("lfs_file_getattr -> %"PRId32, res);
++    LFS_UNLOCK(lfs->cfg);
++    return res;
++}
++
++#ifndef LFS_READONLY
++int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
++        uint8_t type, const void *buffer, lfs_size_t size)
++{
++    int err = LFS_LOCK(lfs->cfg);
++    if (err) {
++        return err;
++    }
+     LFS_TRACE("lfs_file_setattr(%p, %p)", (void*)lfs, (void*)file);
+     LFS_TRACE("lfs_file_setattr(%"PRIu8", %p, %"PRIu32")",
+             type, buffer, size);
+     LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+ 
+-    return lfs_dir_get(lfs, &file->m, LFS_MKTAG(0x7ff, 0x3ff, 0),
+-            LFS_MKTAG(LFS_TYPE_USERATTR + type,
+-                file->id, lfs_min(size, lfs->attr_max)), buffer);
+-}
+-
+-#ifndef LFS_READONLY
+-int lfs_file_setattr(lfs_t *lfs, lfs_file_t *file,
+-        uint8_t type, const void *buffer, lfs_size_t size)
+-{
+-    int err = LFS_LOCK(lfs->cfg);
+-    if (err) {
+-        return err;
+-    }
+-    LFS_TRACE("lfs_file_getattr(%p, %p)", (void*)lfs, (void*)file);
+-    LFS_TRACE("lfs_file_getattr(%"PRIu8", %p, %"PRIu32")",
+-            type, buffer, size);
+-    LFS_ASSERT(lfs_mlist_isopen(lfs->mlist, (struct lfs_mlist*)file));
+-
+-    return lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
+-            {LFS_MKTAG(LFS_TYPE_USERATTR + type, file->id, size), buffer}));
++    if (size > lfs->attr_max) {
++        err = LFS_ERR_NOSPC;
++    } else {
++        err = lfs_dir_commit(lfs, &file->m, LFS_MKATTRS(
++                {LFS_MKTAG(LFS_TYPE_USERATTR + type, file->id, size), buffer}));
++    }
++    LFS_TRACE("lfs_file_setattr -> %d", err);
++    LFS_UNLOCK(lfs->cfg);
++    return err;
+ }
+ #endif
+ 

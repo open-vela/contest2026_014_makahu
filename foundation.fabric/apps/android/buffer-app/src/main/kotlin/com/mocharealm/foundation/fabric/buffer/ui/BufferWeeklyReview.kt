@@ -32,9 +32,7 @@ internal fun WeeklySummaryPanel(summary: BufferWeeklySummary, onGenerate: () -> 
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("${today.minusDays(7).format(date)} — ${today.format(date)}",
                 style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-            Text("这一周的点滴", style = MaterialTheme.typography.headlineMedium)
-            Text("回看留下的想法，也留意自己的状态。", style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("本周记录", style = MaterialTheme.typography.headlineMedium)
         }
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("AI 周总结", style = MaterialTheme.typography.titleLarge)
@@ -42,17 +40,18 @@ internal fun WeeklySummaryPanel(summary: BufferWeeklySummary, onGenerate: () -> 
                 "complete" -> if (generated != null) {
                     Text(generated.title, style = MaterialTheme.typography.titleMedium)
                     Text(generated.summary, style = MaterialTheme.typography.bodyLarge)
-                    Text("由 LLM 根据本周记录生成", style = MaterialTheme.typography.labelMedium,
+                    Text("根据本周记录由 AI 生成", style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 } else ReviewNote("这份总结已从收藏中移除。")
-                "running" -> { LinearProgressIndicator(Modifier.fillMaxWidth()); ReviewNote("正在整理这一周的记录…") }
-                "pending" -> ReviewNote("等待生成；请确认已在设置中配置 LLM 服务。")
+                "running" -> { LinearProgressIndicator(Modifier.fillMaxWidth()); ReviewNote("正在等待结果，生成后会自动保存。") }
+                "pending" -> ReviewNote("等待可用设备和 AI 服务生成。")
                 "failed" -> ReviewNote("生成未成功，稍后会自动重试，也可以立即重试。")
-                else -> ReviewNote("让 LLM 从真实记录中回顾这一周，发现联系并提出少量建议。")
+                "superseded" -> ReviewNote(job?.optString("error").orEmpty().ifBlank { "请求已失效，可重新生成。" })
+                else -> ReviewNote("根据本周记录生成总结。")
             }
         }
         FilledTonalButton(onClick = onGenerate, enabled = job?.optString("state") !in listOf("running", "pending", "complete"), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
-            Text(if (job?.optString("state") == "failed") "重新生成周总结" else if (job?.optString("state") == "complete") "周总结已保存" else "生成 AI 周总结")
+            Text(if (job?.optString("state") == "failed") "重试生成" else if (job?.optString("state") == "superseded") "重新生成" else if (job?.optString("state") == "complete") "周总结已保存" else "生成周总结")
         }
         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)) {
             Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
@@ -69,13 +68,15 @@ internal fun WeeklySummaryPanel(summary: BufferWeeklySummary, onGenerate: () -> 
                 }
             }
         }
+        ResearchWeeklyPanel()
+        HealthQuantSummaryPanel()
         ReviewGroup("值得继续探索", "${summary.rabbitHoleCandidates.size} 个候选主题", summary.rabbitHoleCandidates.isNotEmpty()) {
-            if (summary.rabbitHoleCandidates.isEmpty()) ReviewNote("还没有标记研究主题。遇到想深入的问题时，可以先收藏。")
+            if (summary.rabbitHoleCandidates.isEmpty()) ReviewNote("暂无研究主题。")
             summary.rabbitHoleCandidates.forEach { ReviewEntry(it.title, it.summary) }
         }
         ReviewGroup("生活与照顾", "${summary.lifeOverview.sumOf { it.cardIds.size }} 条已确认记录") {
             val recorded = summary.lifeOverview.filter { it.cardIds.isNotEmpty() }
-            if (recorded.isEmpty()) ReviewNote("这段时间还没有已确认的生活记录。未记录不代表未发生。")
+            if (recorded.isEmpty()) ReviewNote("暂无已确认的生活记录。")
             recorded.forEach { category ->
                 ReviewEntry(category.label, "${category.cardIds.size} 条记录 · ${category.recordedDays} 天" +
                     if (category.examples.isEmpty()) "" else "\n" + category.examples.joinToString("\n"))

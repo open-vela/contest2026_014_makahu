@@ -13,6 +13,7 @@ internal object RecoveryFiles {
         }
         val temporary = File.createTempFile("buffer-recovery-", ".part", destination.parentFile)
         try {
+            android.system.Os.chmod(temporary.absolutePath, 384) // 0600 before writing private bytes.
             temporary.outputStream().use { stream ->
                 stream.write(bytes)
                 stream.fd.sync()

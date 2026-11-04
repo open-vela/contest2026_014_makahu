@@ -10,8 +10,18 @@ import androidx.core.content.ContextCompat
 import java.io.IOException
 import java.util.UUID
 
+internal enum class EnrollmentStep { DISCOVER, CONNECT, CONFIRM, DEVICE_PAIRING, NETWORK, VERIFY, SERVICE_SETUP, DEVICE_FINISH, COMPLETE }
+
 internal data class EnrollmentView(val message: String, val canConfigure: Boolean = false,
-    val active: Boolean = true, val complete: Boolean = false)
+    val active: Boolean = true, val complete: Boolean = false,
+    val step: EnrollmentStep = when {
+        complete -> EnrollmentStep.COMPLETE
+        canConfigure -> EnrollmentStep.NETWORK
+        active -> EnrollmentStep.CONNECT
+        else -> EnrollmentStep.DISCOVER
+    },
+    val pairingCode: Int? = null,
+    val error: Boolean = false)
 
 /** Serializes GATT operations on the main looper; no credentials are logged. */
 @SuppressLint("MissingPermission") // Entry is permission-gated; revocation reaches fail().
@@ -247,7 +257,7 @@ internal class VelaGattEnrollment(context: Context, private val repository: Buff
         } catch (_: Exception) { fail("无法保存取消状态，请重新打开应用检查设备状态"); return }
         close(); update(EnrollmentView("已取消添加", active = false))
     }
-    private fun fail(message: String) { close(); update(EnrollmentView(message, active = false)) }
+    private fun fail(message: String) { close(); update(EnrollmentView(message, active = false, error = true)) }
     override fun close() {
         session++; handler.removeCallbacksAndMessages(null); timeout = null; operation = ""
         fragments.forEach { it.fill(0) }; fragments = emptyList()

@@ -1,0 +1,30 @@
+diff --git a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c
+index ed1a04f37..87a34f6a0 100644
+--- a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c
++++ b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c
+@@ -113,18 +113,22 @@ void lv_draw_g2d_img(lv_draw_unit_t * draw_unit, const lv_draw_image_dsc_t * dsc
+     if(dsc->opa < (lv_opa_t)LV_OPA_MAX && LV_COLOR_FORMAT_IS_NV(cf)) {
+         LV_LOG_WARN("yuv image can't be blended with alpha");
+     }
++    /* All image paths address a draw buffer, whose origin can be a partial
++     * framebuffer strip or an offscreen layer far from screen (0, 0). */
++    lv_area_t local_clip = *draw_unit->clip_area;
++    lv_area_move(&local_clip, -layer->buf_area.x1, -layer->buf_area.y1);
++    lv_area_move(&blend_area, -layer->buf_area.x1, -layer->buf_area.y1);
+     if((dsc->opa >= (lv_opa_t)LV_OPA_MAX && !src_has_alpha) || LV_COLOR_FORMAT_IS_NV(cf))
+         _g2d_blit_no_alpha(layer->draw_buf, &blend_area,
+                            decoder_dsc.decoded, &src_area,
+-                           dsc, draw_unit->clip_area, &layer->buf_area);
++                           dsc, &local_clip, &layer->buf_area);
+     else {
+         if(has_transform) {
+             _g2d_blit_transform(layer->draw_buf, &blend_area,
+                                 decoder_dsc.decoded, &src_area,
+-                                dsc, draw_unit->clip_area, &layer->buf_area);
++                                dsc, &local_clip, &layer->buf_area);
+         }
+         else {
+-            lv_area_move(&blend_area, -layer->buf_area.x1, -layer->buf_area.y1);
+             _g2d_blit(layer->draw_buf, &blend_area,
+                       decoder_dsc.decoded, &src_area, dsc->opa);
+         }

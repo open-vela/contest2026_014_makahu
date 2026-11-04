@@ -1,0 +1,47 @@
+diff --git a/drivers/lcd/ili9341.c b/drivers/lcd/ili9341.c
+index bc3a1d7e09a..407e4411b5b 100644
+--- a/drivers/lcd/ili9341.c
++++ b/drivers/lcd/ili9341.c
+@@ -910,8 +910,17 @@ static int ili9341_getpower(FAR struct lcd_dev_s *dev)
+ 
+ static int ili9341_setpower(FAR struct lcd_dev_s *dev, int power)
+ {
+-  FAR struct ili9341_dev_s *priv = (FAR struct ili9341_dev_s *)dev;
+-  FAR struct ili9341_lcd_s *lcd  = priv->lcd;
++  FAR struct ili9341_dev_s *priv;
++  FAR struct ili9341_lcd_s *lcd;
++  int ret;
++
++  if (dev == NULL || power < 0 || power > CONFIG_LCD_MAXPOWER)
++    {
++      return -EINVAL;
++    }
++
++  priv = (FAR struct ili9341_dev_s *)dev;
++  lcd = priv->lcd;
+ 
+   if (dev)
+     {
+@@ -919,12 +928,18 @@ static int ili9341_setpower(FAR struct lcd_dev_s *dev, int power)
+ 
+       lcd->select(lcd);
+ 
+-      if (power > 0)
+-        {
+-          /* Set backlight level */
++      /* A failed board backlight write must not become a successful ioctl
++       * or overwrite getpower's last acknowledged level. */
+ 
+-          lcd->backlight(lcd, power);
++      ret = lcd->backlight(lcd, power);
++      if (ret < 0)
++        {
++          lcd->deselect(lcd);
++          return ret;
++        }
+ 
++      if (power > 0)
++        {
+           /* And switch LCD on */
+ 
+           lcd->sendcmd(lcd, ILI9341_DISPLAY_ON);

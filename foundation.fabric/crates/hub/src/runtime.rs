@@ -256,6 +256,7 @@ mod quic_runtime {
     use std::{
         collections::{BTreeMap, BTreeSet},
         net::SocketAddr,
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicU64, Ordering},
@@ -273,17 +274,23 @@ mod quic_runtime {
     };
     use fabric_identity::DeviceTrust;
     use fabric_link::{FabricLink, IncomingStream, LinkCloseReason};
+    use fabric_protocol::{
+        COORDINATOR_ELECTION_FEATURE, ControlFrame, ControlMessage, ControlSecurity,
+        ControlSecurityConfig, CoordinatorElectionCertificate, CoordinatorElectionHeartbeat,
+        CoordinatorElectionRequest, CoordinatorElectionVote, CoordinatorElectionVoteRecord,
+        EpochPolicy, IngressDecision, MESSAGE_NONCE_BYTES, OfferRemove, OfferUpsert,
+        PairingComplete, PairingStart, RegistryAck, RegistryResyncRequest, RegistrySnapshotBegin,
+        RegistrySnapshotEnd, SecurityError, SessionAccept, SessionClose, SessionCommit,
+        SessionControlHeader, SessionPrepare, SessionPropose, SessionReady, wire,
+    };
     #[cfg(feature = "clock")]
     use fabric_protocol::{ClockProbe, ClockReply};
-    use fabric_protocol::{
-        ControlFrame, ControlMessage, ControlSecurity, ControlSecurityConfig, EpochPolicy,
-        IngressDecision, MESSAGE_NONCE_BYTES, OfferRemove, OfferUpsert, PairingComplete,
-        PairingStart, RegistryAck, RegistryResyncRequest, RegistrySnapshotBegin,
-        RegistrySnapshotEnd, SecurityError, SessionAccept, SessionCommit, SessionControlHeader,
-        SessionPrepare, SessionPropose, SessionReady, wire,
-    };
     use fabric_registry::{PeerOfferDelta, PeerRegistry, Registry, RegistryRevision, SyncError};
-    use fabric_session::{SessionError, SessionEvent, SessionMachine};
+    use fabric_session::{
+        CoordinatorElection, ElectionCertificate, ElectionError, ElectionStore, ElectionVote,
+        SessionError, SessionEvent, SessionMachine, VoteRequest,
+    };
+    use fabric_storage::{SessionCheckpoint, SqliteElectionStore, Storage};
     use fabric_transport_quic::{HandshakeResult, QuicEndpoint, QuicLink, retain_outbound};
     use rand_core::{OsRng, RngCore};
     use thiserror::Error;
@@ -333,6 +340,11 @@ mod quic_runtime {
         incoming_registries: RwLock<BTreeMap<DeviceId, IncomingRegistryState>>,
         outgoing_registries: Mutex<BTreeMap<DeviceId, OutgoingRegistryState>>,
         sessions: Mutex<BTreeMap<SessionId, NetworkSession>>,
+        peer_features: RwLock<BTreeMap<DeviceId, BTreeSet<String>>>,
+        election_persistence: Option<Arc<CoordinatorPersistence>>,
+        message_listeners: Mutex<
+            BTreeMap<(SessionId, fabric_core::ChannelId, DeviceId), mpsc::Sender<IncomingStream>>,
+        >,
         control_tx: mpsc::Sender<InboundControl>,
         control_rx: Mutex<mpsc::Receiver<InboundControl>>,
         datagram_tx: broadcast::Sender<InboundDatagram>,
@@ -389,6 +401,18 @@ mod quic_runtime {
         machine: SessionMachine,
         coordinator_device: DeviceId,
         proposal: Option<(DeviceId, OperationId)>,
+        election: Option<CoordinatorElection>,
+        last_coordinator_contact: tokio::time::Instant,
+        last_heartbeat_sent: tokio::time::Instant,
+        last_election_activity: tokio::time::Instant,
+        election_jitter: Duration,
+        certificate: Option<ElectionCertificate>,
+    }
+
+    struct CoordinatorPersistence {
+        storage: std::sync::Mutex<Storage>,
+        election_store: Arc<SqliteElectionStore>,
+        restore: std::sync::Mutex<Vec<SessionCheckpoint>>,
     }
 
     #[cfg(feature = "clock")]
@@ -428,6 +452,10 @@ mod quic_runtime {
         InvalidControl,
         #[error("Session security state rejected the transition: {0}")]
         Security(#[from] SecurityError),
+        #[error("coordinator election failed: {0}")]
+        Election(#[from] ElectionError),
+        #[error("durable Session checkpoint failed: {0}")]
+        Persistence(String),
     }
 
     enum OutgoingRegistryDelta {
@@ -479,6 +507,9 @@ mod quic_runtime {
                 incoming_registries: RwLock::new(BTreeMap::new()),
                 outgoing_registries: Mutex::new(BTreeMap::new()),
                 sessions: Mutex::new(BTreeMap::new()),
+                peer_features: RwLock::new(BTreeMap::new()),
+                election_persistence: None,
+                message_listeners: Mutex::new(BTreeMap::new()),
                 control_tx,
                 control_rx: Mutex::new(control_rx),
                 datagram_tx,
@@ -497,6 +528,145 @@ mod quic_runtime {
             }))
         }
 
+        /// Construct the production link runtime with durable Session
+        /// checkpoints and election votes backed by the Hub database.
+        pub fn with_registry_and_database(
+            endpoint: Arc<QuicEndpoint>,
+            registry: Arc<Registry>,
+            event_capacity: usize,
+            database_path: impl AsRef<Path>,
+        ) -> Result<Arc<Self>, String> {
+            let database_path = database_path.as_ref();
+            let mut storage = Storage::open(database_path).map_err(|error| error.to_string())?;
+            let restore = storage
+                .load_recoverable_session_checkpoints(now_ms())
+                .map_err(|error| error.to_string())?;
+            let election_store = Arc::new(
+                SqliteElectionStore::open(database_path).map_err(|error| error.to_string())?,
+            );
+            let mut services = Self::with_registry(endpoint, registry, event_capacity)
+                .map_err(|error| error.to_string())?;
+            let services_mut = Arc::get_mut(&mut services)
+                .ok_or_else(|| "new LinkServices unexpectedly has shared owners".to_owned())?;
+            services_mut.election_persistence = Some(Arc::new(CoordinatorPersistence {
+                storage: std::sync::Mutex::new(storage),
+                election_store,
+                restore: std::sync::Mutex::new(restore),
+            }));
+            Ok(services)
+        }
+
+        async fn restore_coordinator_sessions(&self) -> Result<(), String> {
+            let Some(persistence) = &self.election_persistence else {
+                return Ok(());
+            };
+            let checkpoints = {
+                let mut restore = persistence
+                    .restore
+                    .lock()
+                    .map_err(|_| "session recovery lock poisoned".to_owned())?;
+                std::mem::take(&mut *restore)
+            };
+            let local = self.endpoint.device_id();
+            let mut sessions = self.sessions.lock().await;
+            let mut security = self.security.lock().await;
+            for checkpoint in checkpoints {
+                // JNI application Sessions are bound to a live provider and
+                // its current local approvals. Reopening a Hub cannot restore
+                // those process-owned channels from an old transport plan.
+                if serde_json::from_slice::<serde_json::Value>(
+                    &checkpoint.plan.extensions.opaque_ability_config,
+                )
+                .ok()
+                .is_some_and(|v| {
+                    v.get("kind").and_then(|kind| kind.as_str()) == Some("application")
+                }) {
+                    continue;
+                }
+                let Some(local_participant) = canonical_participant(&checkpoint.plan, local) else {
+                    continue;
+                };
+                let election_store: Arc<dyn ElectionStore> = persistence.election_store.clone();
+                let election = CoordinatorElection::new(
+                    checkpoint.plan.clone(),
+                    local_participant,
+                    election_store,
+                )
+                .map_err(|error| error.to_string())?;
+                let plan = checkpoint.plan;
+                let coordinator_device =
+                    coordinator_device(&plan).map_err(|error| error.to_string())?;
+                let session_id = plan.session_id;
+                let machine =
+                    SessionMachine::restore_suspended(plan, checkpoint.election.term, 128)
+                        .map_err(|error| error.to_string())?;
+                sessions.insert(
+                    session_id,
+                    NetworkSession {
+                        machine,
+                        coordinator_device,
+                        proposal: None,
+                        election: Some(election),
+                        last_coordinator_contact: tokio::time::Instant::now(),
+                        last_heartbeat_sent: tokio::time::Instant::now(),
+                        last_election_activity: tokio::time::Instant::now(),
+                        election_jitter: random_election_jitter(),
+                        certificate: None,
+                    },
+                );
+                security.set_session_epoch(session_id, sessions[&session_id].machine.plan().epoch);
+            }
+            Ok(())
+        }
+
+        fn initialize_session_checkpoint(&self, plan: &SessionPlan) -> Result<(), String> {
+            let Some(persistence) = &self.election_persistence else {
+                return Ok(());
+            };
+            persistence
+                .storage
+                .lock()
+                .map_err(|_| "session storage lock poisoned".to_owned())?
+                .initialize_session_checkpoint(plan, now_ms())
+                .map_err(|error| error.to_string())
+        }
+
+        fn commit_session_checkpoint(
+            &self,
+            previous: &SessionPlan,
+            next: &SessionPlan,
+            certificate: &ElectionCertificate,
+        ) -> Result<(), String> {
+            let Some(persistence) = &self.election_persistence else {
+                return Ok(());
+            };
+            persistence
+                .storage
+                .lock()
+                .map_err(|_| "session storage lock poisoned".to_owned())?
+                .commit_session_checkpoint(
+                    previous,
+                    next,
+                    certificate,
+                    now_ms(),
+                    fabric_storage::FaultPoint::None,
+                )
+                .map_err(|error| error.to_string())
+        }
+
+        fn new_election(&self, plan: &SessionPlan) -> Result<Option<CoordinatorElection>, String> {
+            let Some(persistence) = &self.election_persistence else {
+                return Ok(None);
+            };
+            let local = self.endpoint.device_id();
+            let local_participant = canonical_participant(plan, local)
+                .ok_or_else(|| "local authenticated device is absent from Session".to_owned())?;
+            let store: Arc<dyn ElectionStore> = persistence.election_store.clone();
+            CoordinatorElection::new(plan.clone(), local_participant, store)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+
         pub fn local_addr(&self) -> Result<SocketAddr, fabric_transport_quic::EndpointError> {
             self.endpoint.local_addr()
         }
@@ -504,6 +674,190 @@ mod quic_runtime {
         #[must_use]
         pub fn local_device_id(&self) -> DeviceId {
             self.endpoint.device_id()
+        }
+
+        async fn tick_coordinator_elections(&self, now: tokio::time::Instant) {
+            let session_ids = self
+                .sessions
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            let local = self.endpoint.device_id();
+            for session_id in session_ids {
+                let snapshot = {
+                    let sessions = self.sessions.lock().await;
+                    let Some(session) = sessions.get(&session_id) else {
+                        continue;
+                    };
+                    (
+                        session.machine.plan().clone(),
+                        session.machine.state(),
+                        session.coordinator_device,
+                        session.last_coordinator_contact,
+                        session.last_heartbeat_sent,
+                        session.last_election_activity,
+                    )
+                };
+                let (plan, state, coordinator, last_contact, last_sent, last_activity) = snapshot;
+                if !self.election_supported_by_members(&plan).await {
+                    continue;
+                }
+                if coordinator == local
+                    && matches!(state, SessionState::Active | SessionState::Reconfiguring)
+                {
+                    if elapsed_since(now, last_sent) < COORDINATOR_HEARTBEAT_INTERVAL {
+                        continue;
+                    }
+                    let (term, coordinator_participant, epoch, pending_plan, certificate) = {
+                        let mut sessions = self.sessions.lock().await;
+                        let Some(session) = sessions.get_mut(&session_id) else {
+                            continue;
+                        };
+                        session.last_heartbeat_sent = now;
+                        (
+                            session.machine.coordinator_term(),
+                            session.machine.coordinator(),
+                            session.machine.plan().epoch,
+                            session.machine.pending_plan().cloned(),
+                            session.certificate.clone(),
+                        )
+                    };
+                    let heartbeat = CoordinatorElectionHeartbeat {
+                        header: self.session_header(session_id, epoch),
+                        term,
+                        coordinator: coordinator_participant,
+                        committed_plan_hash: plan.canonical_hash(),
+                    };
+                    let wire = wire::CoordinatorElectionHeartbeat::from(&heartbeat);
+                    for peer in participant_devices(&plan, local) {
+                        if state == SessionState::Reconfiguring {
+                            if let (Some(certificate), Some(pending)) =
+                                (certificate.as_ref(), pending_plan.as_ref())
+                            {
+                                let message = certificate_to_protocol(
+                                    self.session_header(session_id, pending.epoch),
+                                    certificate,
+                                );
+                                let certificate_wire =
+                                    wire::CoordinatorElectionCertificate::from(&message);
+                                let _ = self
+                                    .send_to_peer(
+                                        peer,
+                                        wire::MessageType::CoordinatorElectionCertificate,
+                                        &certificate_wire,
+                                    )
+                                    .await;
+                                if let Ok(encoded_final_plan) = serde_json::to_vec(pending) {
+                                    let prepare = SessionPrepare {
+                                        header: self.session_header(session_id, pending.epoch),
+                                        coordinator_term: certificate.term,
+                                        encoded_final_plan,
+                                        plan_hash: pending.canonical_hash(),
+                                    };
+                                    let prepare_wire = wire::SessionPrepare::from(&prepare);
+                                    let _ = self
+                                        .send_to_peer(
+                                            peer,
+                                            wire::MessageType::SessionPrepare,
+                                            &prepare_wire,
+                                        )
+                                        .await;
+                                }
+                            }
+                            // The snapshot's committed plan may become stale while the
+                            // awaited certificate/prepare sends are in flight. Those
+                            // messages already refresh election contact; do not follow
+                            // them with a same-term heartbeat carrying the old hash.
+                            continue;
+                        }
+                        let _ = self
+                            .send_to_peer(
+                                peer,
+                                wire::MessageType::CoordinatorElectionHeartbeat,
+                                &wire,
+                            )
+                            .await;
+                    }
+                    continue;
+                }
+                if !matches!(
+                    state,
+                    SessionState::Active | SessionState::Suspended | SessionState::Reconfiguring
+                ) {
+                    continue;
+                }
+                let rank = election_candidate_rank(&plan, local);
+                let Some(rank) = rank else {
+                    continue;
+                };
+                let jitter = self
+                    .sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map_or(Duration::ZERO, |session| session.election_jitter);
+                let timeout = COORDINATOR_FAILURE_TIMEOUT
+                    .saturating_add(COORDINATOR_CANDIDATE_STAGGER.saturating_mul(rank as u32));
+                let timeout = timeout.saturating_add(jitter);
+                if elapsed_since(now, last_contact) < timeout
+                    || elapsed_since(now, last_activity) < timeout
+                {
+                    continue;
+                }
+                self.begin_local_election(session_id, now).await;
+            }
+        }
+
+        async fn begin_local_election(&self, session_id: SessionId, now: tokio::time::Instant) {
+            let identity = self.endpoint.device_identity();
+            let request = {
+                let mut sessions = self.sessions.lock().await;
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    return;
+                };
+                let Some(election) = session.election.as_mut() else {
+                    return;
+                };
+                let Ok((request, _own_vote)) = election.begin_election(identity.as_ref()) else {
+                    return;
+                };
+                if request.term > session.machine.coordinator_term()
+                    && session
+                        .machine
+                        .fence_after_higher_term(request.term)
+                        .is_err()
+                {
+                    return;
+                }
+                session.last_election_activity = now;
+                request
+            };
+            let message = CoordinatorElectionRequest {
+                header: self.session_header(session_id, request.committed_epoch),
+                term: request.term,
+                membership_hash: request.membership_hash,
+                committed_epoch: request.committed_epoch,
+                committed_plan_hash: request.committed_plan_hash,
+                candidate: request.candidate,
+                candidate_device: request.candidate_device,
+                candidate_public_key: request.candidate_public_key,
+                signature: request.signature,
+            };
+            let wire = wire::CoordinatorElectionRequest::from(&message);
+            let plan = {
+                let sessions = self.sessions.lock().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    return;
+                };
+                session.machine.plan().clone()
+            };
+            for peer in participant_devices(&plan, self.endpoint.device_id()) {
+                let _ = self
+                    .send_to_peer(peer, wire::MessageType::CoordinatorElectionRequest, &wire)
+                    .await;
+            }
         }
 
         pub async fn next_control(&self) -> Option<InboundControl> {
@@ -574,6 +928,12 @@ mod quic_runtime {
                         machine,
                         coordinator_device,
                         proposal: None,
+                        election: None,
+                        last_coordinator_contact: tokio::time::Instant::now(),
+                        last_heartbeat_sent: tokio::time::Instant::now(),
+                        last_election_activity: tokio::time::Instant::now(),
+                        election_jitter: random_election_jitter(),
+                        certificate: None,
                     },
                 );
             }
@@ -654,12 +1014,43 @@ mod quic_runtime {
                 .map(|session| session.machine.state())
         }
 
+        pub async fn network_session_coordinator(
+            &self,
+            session_id: SessionId,
+        ) -> Option<(fabric_core::ParticipantId, DeviceId, u64)> {
+            self.sessions.lock().await.get(&session_id).map(|session| {
+                (
+                    session.machine.coordinator(),
+                    session.coordinator_device,
+                    session.machine.coordinator_term(),
+                )
+            })
+        }
+
         pub async fn link(&self, peer: DeviceId) -> Option<Arc<QuicLink>> {
             self.links
                 .read()
                 .await
                 .get(&peer)
                 .map(|active| Arc::clone(&active.link))
+        }
+
+        async fn election_supported_by_members(&self, plan: &SessionPlan) -> bool {
+            if self.election_persistence.is_none() {
+                return false;
+            }
+            let local = self.endpoint.device_id();
+            let members = participant_devices_including_local(plan);
+            if members.len() < 2 {
+                return false;
+            }
+            let features = self.peer_features.read().await;
+            members.into_iter().all(|device| {
+                device == local
+                    || features
+                        .get(&device)
+                        .is_some_and(|values| values.contains(COORDINATOR_ELECTION_FEATURE))
+            })
         }
 
         /// Last physical discovery/manual address that authenticated as `peer`.
@@ -682,6 +1073,54 @@ mod quic_runtime {
                 .await
                 .get(&peer)
                 .map(|active| active.direction == LinkDirection::Outbound)
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn age_coordinator_contact_for_test(
+            &self,
+            session_id: SessionId,
+            age: Duration,
+        ) -> bool {
+            let Some(past) = tokio::time::Instant::now().checked_sub(age) else {
+                return false;
+            };
+            let mut sessions = self.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&session_id) else {
+                return false;
+            };
+            session.last_coordinator_contact = past;
+            session.last_election_activity = past;
+            true
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn election_supported_for_test(&self, plan: &SessionPlan) -> bool {
+            self.election_supported_by_members(plan).await
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn network_session_plan_for_test(
+            &self,
+            session_id: SessionId,
+        ) -> Option<SessionPlan> {
+            self.sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|session| session.machine.plan().clone())
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn election_state_for_test(
+            &self,
+            session_id: SessionId,
+        ) -> Option<fabric_session::ElectionPersistentState> {
+            self.sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|session| session.election.as_ref())
+                .and_then(|election| election.persistent_state().ok())
         }
 
         pub async fn connect(
@@ -825,11 +1264,71 @@ mod quic_runtime {
         }
 
         pub async fn remove_session(&self, session_id: fabric_core::SessionId) {
+            self.sessions.lock().await.remove(&session_id);
+            self.message_listeners
+                .lock()
+                .await
+                .retain(|(id, _, _), _| *id != session_id);
             self.security.lock().await.remove_session(session_id);
+        }
+
+        /// Retire locally before notifying peers; no new message may use a
+        /// Session while a disconnected peer delays its close notification.
+        pub async fn close_network_session(
+            &self,
+            session_id: SessionId,
+            reason: &str,
+        ) -> Result<(), String> {
+            let plan = self
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|s| s.machine.plan().clone());
+            let epoch = self.security.lock().await.session_epoch(session_id);
+            let notification = epoch.map(|epoch| {
+                wire::SessionClose::from(&SessionClose {
+                    header: self.session_header(session_id, epoch),
+                    reason: reason.chars().take(160).collect(),
+                })
+            });
+            self.remove_session(session_id).await;
+            let stored =
+                if let (Some(plan), Some(persistence)) = (&plan, &self.election_persistence) {
+                    persistence
+                        .storage
+                        .lock()
+                        .map_err(|_| "session storage lock poisoned".to_owned())
+                        .and_then(|mut store| {
+                            store
+                                .save_session(plan, SessionState::Closed, None, now_ms())
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    Ok(())
+                };
+            if let (Some(plan), Some(message)) = (plan, notification) {
+                for peer in participant_devices(&plan, self.endpoint.device_id()) {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(250),
+                        self.send_to_peer(peer, wire::MessageType::SessionClose, &message),
+                    )
+                    .await;
+                }
+            }
+            stored
+        }
+
+        pub async fn network_session_epoch(&self, session_id: SessionId) -> Option<u64> {
+            self.security.lock().await.session_epoch(session_id)
         }
 
         async fn install(self: &Arc<Self>, result: HandshakeResult, direction: LinkDirection) {
             let peer = result.peer_device_id;
+            self.peer_features
+                .write()
+                .await
+                .insert(peer, result.peer_features.iter().cloned().collect());
             let link = result.link;
             let registry_send = Arc::new(Mutex::new(()));
             let preferred = if retain_outbound(self.endpoint.device_id(), peer) {
@@ -953,10 +1452,7 @@ mod quic_runtime {
                                 break;
                             }
                         }
-                        if services
-                            .process_session_message(peer, &message)
-                            .await
-                            .is_err()
+                        if let Err(_error) = services.process_session_message(peer, &message).await
                         {
                             let mut security = services.security.lock().await;
                             security.abandon(ingress.header.operation_id);
@@ -1017,6 +1513,23 @@ mod quic_runtime {
                         link.close(LinkCloseReason::ProtocolError).await;
                         break;
                     }
+                    if let IncomingStream::Bi(ref open, _) = stream
+                        && fabric_platform::is_reliable_message_stream(open)
+                    {
+                        let listener = services
+                            .message_listeners
+                            .lock()
+                            .await
+                            .get(&(open.session_id, open.channel_id, peer))
+                            .cloned();
+                        // Never pass application message streams to the generic
+                        // framework-control/stream consumers. Unregistered or
+                        // duplicate opens are rejected by dropping the stream.
+                        if let Some(listener) = listener {
+                            let _ = listener.try_send(stream);
+                        }
+                        continue;
+                    }
                     if services
                         .stream_tx
                         .send(InboundStream { peer, stream })
@@ -1030,6 +1543,485 @@ mod quic_runtime {
             });
         }
 
+        async fn process_election_request(
+            &self,
+            peer: DeviceId,
+            value: &CoordinatorElectionRequest,
+        ) -> Result<(), NetworkSessionError> {
+            let plan = self
+                .sessions
+                .lock()
+                .await
+                .get(&value.header.session_id)
+                .map(|session| session.machine.plan().clone())
+                .ok_or(NetworkSessionError::NotFound)?;
+            if !self.election_supported_by_members(&plan).await {
+                return Err(NetworkSessionError::InvalidControl);
+            }
+            let request = request_from_protocol(value);
+            if value.header.expected_epoch != request.committed_epoch
+                || plan.epoch != request.committed_epoch
+                || plan.canonical_hash() != request.committed_plan_hash
+            {
+                // A commit may have advanced the in-memory Session plan just
+                // before its election store is updated. Delayed requests for
+                // the old checkpoint are stale and must not close the Link.
+                self.security
+                    .lock()
+                    .await
+                    .complete(value.header.operation_id, Vec::new())?;
+                return Ok(());
+            }
+            let identity = self.endpoint.device_identity();
+            let vote = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&value.header.session_id)
+                    .ok_or(NetworkSessionError::NotFound)?;
+                if session.machine.plan() != &plan
+                    || !matches!(
+                        session.machine.state(),
+                        SessionState::Active
+                            | SessionState::Suspended
+                            | SessionState::Reconfiguring
+                    )
+                {
+                    return Err(NetworkSessionError::InvalidControl);
+                }
+                if session.machine.plan().epoch != request.committed_epoch
+                    || session.machine.plan().canonical_hash() != request.committed_plan_hash
+                {
+                    None
+                } else {
+                    session
+                        .election
+                        .as_ref()
+                        .ok_or(NetworkSessionError::InvalidControl)?
+                        .validate_request(&request, peer)?;
+                    if request.term > session.machine.coordinator_term() {
+                        // A verified higher term immediately fences old local
+                        // controls. If the durable write fails below, this
+                        // Session stays suspended until restart/recovery.
+                        session.machine.fence_after_higher_term(request.term)?;
+                        session.last_election_activity = tokio::time::Instant::now();
+                    }
+                    let (vote_result, durable_term) = {
+                        let election = session
+                            .election
+                            .as_mut()
+                            .ok_or(NetworkSessionError::InvalidControl)?;
+                        let vote_result = election.cast_vote(&request, peer, identity.as_ref());
+                        let durable_term = election.persistent_state()?.term;
+                        (vote_result, durable_term)
+                    };
+                    if durable_term > session.machine.coordinator_term() {
+                        session.machine.fence_after_higher_term(durable_term)?;
+                        session.last_election_activity = tokio::time::Instant::now();
+                    }
+                    match vote_result {
+                        Ok(vote) => {
+                            session.last_election_activity = tokio::time::Instant::now();
+                            Some(vote)
+                        }
+                        // A competing same-term candidate is an expected election
+                        // outcome. No signature is returned and the fixed-member
+                        // majority rule decides which candidate can proceed.
+                        Err(ElectionError::AlreadyVoted) => {
+                            session.last_election_activity = tokio::time::Instant::now();
+                            None
+                        }
+                        Err(ElectionError::StaleTerm) => None,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            };
+            if let Some(vote) = vote {
+                let response = CoordinatorElectionVote {
+                    header: self
+                        .session_header(value.header.session_id, value.header.expected_epoch),
+                    vote: vote_record_to_protocol(&vote),
+                };
+                let wire = wire::CoordinatorElectionVote::from(&response);
+                let encoded =
+                    self.encode_wire(wire::MessageType::CoordinatorElectionVote, &wire)?;
+                self.security
+                    .lock()
+                    .await
+                    .complete(value.header.operation_id, encoded.clone())?;
+                let link = self
+                    .link(peer)
+                    .await
+                    .ok_or(NetworkSessionError::LinkUnavailable)?;
+                link.send_control(Bytes::from(encoded))
+                    .await
+                    .map_err(|_| NetworkSessionError::LinkUnavailable)?;
+            } else {
+                self.security
+                    .lock()
+                    .await
+                    .complete(value.header.operation_id, Vec::new())?;
+            }
+            Ok(())
+        }
+
+        async fn process_election_vote(
+            &self,
+            peer: DeviceId,
+            value: &CoordinatorElectionVote,
+        ) -> Result<(), NetworkSessionError> {
+            let plan = self
+                .sessions
+                .lock()
+                .await
+                .get(&value.header.session_id)
+                .map(|session| session.machine.plan().clone())
+                .ok_or(NetworkSessionError::NotFound)?;
+            if !self.election_supported_by_members(&plan).await || value.vote.voter_device != peer {
+                return Err(NetworkSessionError::InvalidControl);
+            }
+            let certificate = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&value.header.session_id)
+                    .ok_or(NetworkSessionError::NotFound)?;
+                if session.machine.plan() != &plan {
+                    return Err(NetworkSessionError::InvalidControl);
+                }
+                if value.vote.term <= session.machine.coordinator_term() {
+                    None
+                } else {
+                    let election = session
+                        .election
+                        .as_mut()
+                        .ok_or(NetworkSessionError::InvalidControl)?;
+                    let local_candidate = canonical_participant(&plan, self.endpoint.device_id())
+                        .ok_or(NetworkSessionError::InvalidControl)?;
+                    if !election.is_active_candidate(value.vote.term, local_candidate) {
+                        None
+                    } else {
+                        let vote = vote_from_protocol(value.header.session_id, value.vote.clone());
+                        match election.add_vote(vote) {
+                            Ok(true) => Some(election.certificate()?),
+                            Ok(false)
+                            | Err(ElectionError::StaleTerm | ElectionError::ConflictingVotes) => {
+                                None
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            };
+            self.security
+                .lock()
+                .await
+                .complete(value.header.operation_id, Vec::new())?;
+            if let Some(certificate) = certificate {
+                if self
+                    .install_election_certificate(certificate.clone())
+                    .await?
+                {
+                    self.broadcast_election_certificate(&plan, &certificate)
+                        .await;
+                    self.begin_elected_reconfiguration(value.header.session_id)
+                        .await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn process_election_certificate(
+            &self,
+            peer: DeviceId,
+            value: &CoordinatorElectionCertificate,
+        ) -> Result<(), NetworkSessionError> {
+            let certificate = certificate_from_protocol(value);
+            let (plan, term, installed) = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&value.header.session_id)
+                    .ok_or(NetworkSessionError::NotFound)?;
+                let term = session.machine.coordinator_term();
+                let installed =
+                    session.certificate.as_ref() == Some(&certificate) && certificate.term == term;
+                if installed {
+                    let now = tokio::time::Instant::now();
+                    session.last_coordinator_contact = now;
+                    session.last_election_activity = now;
+                }
+                (session.machine.plan().clone(), term, installed)
+            };
+            if installed || certificate.term < term {
+                self.security
+                    .lock()
+                    .await
+                    .complete(value.header.operation_id, Vec::new())?;
+                return Ok(());
+            }
+            if certificate.term == term {
+                return Err(NetworkSessionError::InvalidControl);
+            }
+            if !self.election_supported_by_members(&plan).await
+                || device_for_participant(&plan, certificate.candidate) != Some(peer)
+            {
+                return Err(NetworkSessionError::InvalidControl);
+            }
+            self.install_election_certificate(certificate).await?;
+            self.security
+                .lock()
+                .await
+                .complete(value.header.operation_id, Vec::new())?;
+            Ok(())
+        }
+
+        async fn process_election_heartbeat(
+            &self,
+            peer: DeviceId,
+            value: &CoordinatorElectionHeartbeat,
+        ) -> Result<(), NetworkSessionError> {
+            let plan = self
+                .sessions
+                .lock()
+                .await
+                .get(&value.header.session_id)
+                .map(|session| session.machine.plan().clone())
+                .ok_or(NetworkSessionError::NotFound)?;
+            if !self.election_supported_by_members(&plan).await {
+                return Err(NetworkSessionError::InvalidControl);
+            }
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&value.header.session_id)
+                .ok_or(NetworkSessionError::NotFound)?;
+            let current_term = session.machine.coordinator_term();
+            let current_plan_hash = session.machine.plan().canonical_hash();
+            if value.term < current_term || session.machine.coordinator_fenced() {
+                // Delayed heartbeats from an old term are harmless and must not
+                // tear down an otherwise healthy authenticated Link.
+            } else if value.term == current_term && value.committed_plan_hash != current_plan_hash {
+                // A same-term heartbeat can be queued behind a reconfiguration
+                // commit. It cannot refresh contact for a different plan, but it
+                // must not tear down the link when its committed hash is stale.
+            } else if session.machine.plan().canonical_hash() != value.committed_plan_hash
+                || session.machine.coordinator() != value.coordinator
+                || session.coordinator_device != peer
+                || device_for_participant(session.machine.plan(), value.coordinator) != Some(peer)
+                || session.machine.coordinator_term() != value.term
+            {
+                return Err(NetworkSessionError::InvalidControl);
+            } else {
+                let now = tokio::time::Instant::now();
+                session.last_coordinator_contact = now;
+                session.last_election_activity = now;
+            }
+            drop(sessions);
+            self.security
+                .lock()
+                .await
+                .complete(value.header.operation_id, Vec::new())?;
+            Ok(())
+        }
+
+        async fn install_election_certificate(
+            &self,
+            certificate: ElectionCertificate,
+        ) -> Result<bool, NetworkSessionError> {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(&certificate.session_id)
+                .ok_or(NetworkSessionError::NotFound)?;
+            certificate.verify(session.machine.plan())?;
+            if session.certificate.as_ref() == Some(&certificate) {
+                let now = tokio::time::Instant::now();
+                session.last_coordinator_contact = now;
+                session.last_election_activity = now;
+                return Ok(false);
+            }
+            if certificate.term <= session.machine.coordinator_term() {
+                return Ok(false);
+            }
+            if certificate.term > session.machine.coordinator_term() {
+                // Validate the proof first, then fence before touching storage.
+                // If persistence fails, old-term Prepare/Ready/Commit remain
+                // disabled in this process and restart recovery is suspended.
+                session.machine.fence_after_higher_term(certificate.term)?;
+                session.last_election_activity = tokio::time::Instant::now();
+            }
+            let election = session
+                .election
+                .as_mut()
+                .ok_or(NetworkSessionError::InvalidControl)?;
+            match session.machine.apply_election_certificate(
+                election,
+                OperationId::new(),
+                certificate.clone(),
+            ) {
+                Ok(_) => {}
+                Err(SessionError::Election(ElectionError::StaleTerm)) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+            let coordinator = device_for_participant(session.machine.plan(), certificate.candidate)
+                .ok_or(NetworkSessionError::InvalidControl)?;
+            session.coordinator_device = coordinator;
+            let now = tokio::time::Instant::now();
+            session.last_coordinator_contact = now;
+            session.last_heartbeat_sent = now;
+            session.last_election_activity = now;
+            session.certificate = Some(certificate);
+            Ok(true)
+        }
+
+        async fn broadcast_election_certificate(
+            &self,
+            plan: &SessionPlan,
+            certificate: &ElectionCertificate,
+        ) {
+            let local = self.endpoint.device_id();
+            for peer in participant_devices(plan, local) {
+                let message = certificate_to_protocol(
+                    self.session_header(certificate.session_id, plan.epoch),
+                    certificate,
+                );
+                let wire = wire::CoordinatorElectionCertificate::from(&message);
+                let _ = self
+                    .send_to_peer(
+                        peer,
+                        wire::MessageType::CoordinatorElectionCertificate,
+                        &wire,
+                    )
+                    .await;
+            }
+        }
+
+        async fn begin_elected_reconfiguration(
+            &self,
+            session_id: SessionId,
+        ) -> Result<(), NetworkSessionError> {
+            let local = self.endpoint.device_id();
+            let (plan, coordinator_term) = {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&session_id)
+                    .ok_or(NetworkSessionError::NotFound)?;
+                if session.coordinator_device != local {
+                    return Ok(());
+                }
+                if !matches!(
+                    session.machine.state(),
+                    SessionState::Active | SessionState::Suspended
+                ) {
+                    return Ok(());
+                }
+                let certificate = session
+                    .certificate
+                    .clone()
+                    .ok_or(NetworkSessionError::InvalidControl)?;
+                let mut next = session.machine.plan().clone();
+                next.epoch = next
+                    .epoch
+                    .checked_add(1)
+                    .ok_or(NetworkSessionError::InvalidControl)?;
+                next.coordinator = certificate.candidate;
+                session.machine.apply(SessionEvent::Reconfigure {
+                    operation_id: OperationId::new(),
+                    term: certificate.term,
+                    plan: next.clone(),
+                })?;
+                ready_device_participants(
+                    &mut session.machine,
+                    &next,
+                    local,
+                    certificate.term,
+                    next.canonical_hash(),
+                    None,
+                )?;
+                (next, certificate.term)
+            };
+            let prepare = SessionPrepare {
+                header: self.session_header(session_id, plan.epoch),
+                coordinator_term,
+                encoded_final_plan: serde_json::to_vec(&plan)
+                    .map_err(|_| NetworkSessionError::InvalidControl)?,
+                plan_hash: plan.canonical_hash(),
+            };
+            let wire = wire::SessionPrepare::from(&prepare);
+            for peer in participant_devices(&plan, local) {
+                let _ = self
+                    .send_to_peer(peer, wire::MessageType::SessionPrepare, &wire)
+                    .await;
+            }
+            Ok(())
+        }
+
+        async fn finalize_session_commit(
+            &self,
+            session_id: SessionId,
+            previous: &SessionPlan,
+            next: &SessionPlan,
+            certificate: Option<&ElectionCertificate>,
+            expected_security_epoch: u64,
+        ) -> Result<(), NetworkSessionError> {
+            let persistence_result = if let Some(certificate) = certificate {
+                self.commit_session_checkpoint(previous, next, certificate)
+            } else {
+                self.initialize_session_checkpoint(next)
+            };
+            if let Err(error) = persistence_result {
+                self.suspend_session_after_persistence_failure(session_id)
+                    .await;
+                return Err(NetworkSessionError::Persistence(error));
+            }
+
+            if certificate.is_some() {
+                let mut sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&session_id)
+                    .ok_or(NetworkSessionError::NotFound)?;
+                let election = session
+                    .election
+                    .as_mut()
+                    .ok_or(NetworkSessionError::InvalidControl)?;
+                if let Err(error) = election.record_committed_plan(next.clone()) {
+                    drop(sessions);
+                    self.suspend_session_after_persistence_failure(session_id)
+                        .await;
+                    return Err(error.into());
+                }
+            } else {
+                let election = self
+                    .new_election(next)
+                    .map_err(NetworkSessionError::Persistence)?;
+                if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+                    session.election = election;
+                }
+            }
+
+            if let Err(error) = self
+                .security
+                .lock()
+                .await
+                .advance_session_epoch(session_id, expected_security_epoch)
+            {
+                self.suspend_session_after_persistence_failure(session_id)
+                    .await;
+                return Err(error.into());
+            }
+            if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+                let now = tokio::time::Instant::now();
+                session.last_coordinator_contact = now;
+                session.last_heartbeat_sent = now;
+                session.last_election_activity = now;
+            }
+            Ok(())
+        }
+
+        async fn suspend_session_after_persistence_failure(&self, session_id: SessionId) {
+            if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+                let _ = session.machine.apply(SessionEvent::Suspend {
+                    operation_id: OperationId::new(),
+                });
+            }
+        }
+
         #[allow(clippy::too_many_lines)]
         async fn process_session_message(
             &self,
@@ -1037,6 +2029,49 @@ mod quic_runtime {
             message: &ControlMessage,
         ) -> Result<(), NetworkSessionError> {
             match message {
+                ControlMessage::SessionClose(value) => {
+                    let plan = self
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&value.header.session_id)
+                        .map(|s| s.machine.plan().clone());
+                    if !plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.participants.iter().any(|p| p.device_id == peer))
+                    {
+                        return Err(NetworkSessionError::InvalidControl);
+                    }
+                    self.remove_session(value.header.session_id).await;
+                    if let (Some(plan), Some(persistence)) = (plan, &self.election_persistence) {
+                        persistence
+                            .storage
+                            .lock()
+                            .map_err(|_| {
+                                NetworkSessionError::Persistence(
+                                    "session storage lock poisoned".into(),
+                                )
+                            })?
+                            .save_session(&plan, SessionState::Closed, None, now_ms())
+                            .map_err(|error| NetworkSessionError::Persistence(error.to_string()))?;
+                    }
+                    self.security
+                        .lock()
+                        .await
+                        .complete(value.header.operation_id, Vec::new())?;
+                }
+                ControlMessage::CoordinatorElectionRequest(value) => {
+                    self.process_election_request(peer, value).await?;
+                }
+                ControlMessage::CoordinatorElectionVote(value) => {
+                    self.process_election_vote(peer, value).await?;
+                }
+                ControlMessage::CoordinatorElectionCertificate(value) => {
+                    self.process_election_certificate(peer, value).await?;
+                }
+                ControlMessage::CoordinatorElectionHeartbeat(value) => {
+                    self.process_election_heartbeat(peer, value).await?;
+                }
                 ControlMessage::SessionPropose(value) => {
                     let plan: SessionPlan = serde_json::from_slice(&value.encoded_draft_plan)
                         .map_err(|_| NetworkSessionError::InvalidControl)?;
@@ -1064,6 +2099,12 @@ mod quic_runtime {
                             machine,
                             coordinator_device: peer,
                             proposal: Some((peer, value.header.operation_id)),
+                            election: None,
+                            last_coordinator_contact: tokio::time::Instant::now(),
+                            last_heartbeat_sent: tokio::time::Instant::now(),
+                            last_election_activity: tokio::time::Instant::now(),
+                            election_jitter: random_election_jitter(),
+                            certificate: None,
                         },
                     );
                 }
@@ -1085,6 +2126,7 @@ mod quic_runtime {
                         )?;
                         match session.machine.apply(SessionEvent::Prepare {
                             operation_id: OperationId::new(),
+                            term: 0,
                             plan: plan.clone(),
                         }) {
                             Ok(_) => {
@@ -1092,6 +2134,7 @@ mod quic_runtime {
                                     &mut session.machine,
                                     &plan,
                                     self.endpoint.device_id(),
+                                    0,
                                     plan.canonical_hash(),
                                     None,
                                 )?;
@@ -1109,6 +2152,7 @@ mod quic_runtime {
                         let hash = plan.canonical_hash();
                         let prepare = SessionPrepare {
                             header: self.session_header(plan.session_id, plan.epoch),
+                            coordinator_term: 0,
                             encoded_final_plan: serde_json::to_vec(&plan)
                                 .map_err(|_| NetworkSessionError::InvalidControl)?,
                             plan_hash: hash,
@@ -1127,35 +2171,106 @@ mod quic_runtime {
                 ControlMessage::SessionPrepare(value) => {
                     let plan: SessionPlan = serde_json::from_slice(&value.encoded_final_plan)
                         .map_err(|_| NetworkSessionError::InvalidControl)?;
+                    plan.validate()
+                        .map_err(|_| NetworkSessionError::InvalidControl)?;
                     if plan.session_id != value.header.session_id
                         || plan.canonical_hash() != value.plan_hash
                     {
                         return Err(NetworkSessionError::InvalidControl);
+                    }
+                    let duplicate_committed_prepare = {
+                        let sessions = self.sessions.lock().await;
+                        let session = sessions
+                            .get(&value.header.session_id)
+                            .ok_or(NetworkSessionError::NotFound)?;
+                        session.machine.state() == SessionState::Active
+                            && session.coordinator_device == peer
+                            && session.machine.coordinator_term() == value.coordinator_term
+                            && session.machine.plan() == &plan
+                    };
+                    if duplicate_committed_prepare {
+                        self.security
+                            .lock()
+                            .await
+                            .complete(value.header.operation_id, Vec::new())?;
+                        return Ok(());
                     }
                     let ready = {
                         let mut sessions = self.sessions.lock().await;
                         let session = sessions
                             .get_mut(&value.header.session_id)
                             .ok_or(NetworkSessionError::NotFound)?;
-                        if session.coordinator_device != peer || session.machine.plan() != &plan {
+                        if session.coordinator_device != peer {
                             return Err(NetworkSessionError::InvalidControl);
                         }
-                        for device in participant_devices_including_local(&plan) {
-                            accept_device_participants(&mut session.machine, &plan, device, None)?;
+                        let current = session.machine.plan().clone();
+                        let term = session.machine.coordinator_term();
+                        if value.coordinator_term != term {
+                            return Err(NetworkSessionError::InvalidControl);
                         }
-                        session.machine.apply(SessionEvent::Prepare {
-                            operation_id: value.header.operation_id,
-                            plan: plan.clone(),
-                        })?;
+                        match session.machine.state() {
+                            SessionState::Negotiating => {
+                                if current != plan {
+                                    return Err(NetworkSessionError::InvalidControl);
+                                }
+                                for device in participant_devices_including_local(&plan) {
+                                    accept_device_participants(
+                                        &mut session.machine,
+                                        &plan,
+                                        device,
+                                        None,
+                                    )?;
+                                }
+                                session.machine.apply(SessionEvent::Prepare {
+                                    operation_id: value.header.operation_id,
+                                    term,
+                                    plan: plan.clone(),
+                                })?;
+                            }
+                            SessionState::Active | SessionState::Suspended => {
+                                let certificate = session
+                                    .certificate
+                                    .as_ref()
+                                    .ok_or(NetworkSessionError::InvalidControl)?;
+                                if certificate.term != term
+                                    || plan.coordinator != certificate.candidate
+                                    || plan.epoch != current.epoch.saturating_add(1)
+                                    || fabric_session::membership_config_hash(&plan)
+                                        != fabric_session::membership_config_hash(&current)
+                                {
+                                    return Err(NetworkSessionError::InvalidControl);
+                                }
+                                session.machine.apply(SessionEvent::Reconfigure {
+                                    operation_id: value.header.operation_id,
+                                    term,
+                                    plan: plan.clone(),
+                                })?;
+                            }
+                            SessionState::Reconfiguring => {
+                                let certificate = session
+                                    .certificate
+                                    .as_ref()
+                                    .ok_or(NetworkSessionError::InvalidControl)?;
+                                if certificate.term != term
+                                    || plan.coordinator != certificate.candidate
+                                    || session.machine.pending_plan() != Some(&plan)
+                                {
+                                    return Err(NetworkSessionError::InvalidControl);
+                                }
+                            }
+                            _ => return Err(NetworkSessionError::InvalidControl),
+                        }
                         ready_device_participants(
                             &mut session.machine,
                             &plan,
                             self.endpoint.device_id(),
+                            term,
                             value.plan_hash,
                             None,
                         )?;
                         SessionReady {
                             header: self.session_header(plan.session_id, plan.epoch),
+                            coordinator_term: term,
                             plan_hash: value.plan_hash,
                         }
                     };
@@ -1169,6 +2284,30 @@ mod quic_runtime {
                         .await?;
                 }
                 ControlMessage::SessionReady(value) => {
+                    let duplicate_committed_ready = {
+                        let sessions = self.sessions.lock().await;
+                        let session = sessions
+                            .get(&value.header.session_id)
+                            .ok_or(NetworkSessionError::NotFound)?;
+                        session.machine.state() == SessionState::Active
+                            && session.coordinator_device == self.endpoint.device_id()
+                            && session.machine.coordinator_term() == value.coordinator_term
+                            && session.machine.plan().epoch == value.header.expected_epoch
+                            && session.machine.plan().canonical_hash() == value.plan_hash
+                            && session
+                                .machine
+                                .plan()
+                                .participants
+                                .iter()
+                                .any(|participant| participant.device_id == peer)
+                    };
+                    if duplicate_committed_ready {
+                        self.security
+                            .lock()
+                            .await
+                            .complete(value.header.operation_id, Vec::new())?;
+                        return Ok(());
+                    }
                     let commit = {
                         let mut sessions = self.sessions.lock().await;
                         let session = sessions
@@ -1177,22 +2316,39 @@ mod quic_runtime {
                         if session.coordinator_device != self.endpoint.device_id() {
                             return Err(NetworkSessionError::NotCoordinator);
                         }
-                        let plan = session.machine.plan().clone();
-                        if plan.canonical_hash() != value.plan_hash {
+                        let Some(next) = session.machine.pending_plan().cloned() else {
+                            return Err(NetworkSessionError::InvalidControl);
+                        };
+                        if next.canonical_hash() != value.plan_hash
+                            || value.coordinator_term != session.machine.coordinator_term()
+                        {
                             return Err(NetworkSessionError::InvalidControl);
                         }
+                        let term = session.machine.coordinator_term();
+                        let previous = session.machine.plan().clone();
                         ready_device_participants(
                             &mut session.machine,
-                            &plan,
+                            &next,
                             peer,
+                            term,
                             value.plan_hash,
                             Some(value.header.operation_id),
                         )?;
                         match session.machine.apply(SessionEvent::Commit {
                             operation_id: OperationId::new(),
+                            term,
                             plan_hash: value.plan_hash,
                         }) {
-                            Ok(_) => Some(plan),
+                            Ok(_) => Some((
+                                previous.clone(),
+                                next,
+                                session.certificate.clone(),
+                                if session.certificate.is_some() {
+                                    previous.epoch
+                                } else {
+                                    0
+                                },
+                            )),
                             Err(SessionError::ParticipantsNotReady) => None,
                             Err(error) => return Err(error.into()),
                         }
@@ -1201,13 +2357,20 @@ mod quic_runtime {
                         .lock()
                         .await
                         .complete(value.header.operation_id, Vec::new())?;
-                    if let Some(plan) = commit {
-                        self.security
-                            .lock()
-                            .await
-                            .advance_session_epoch(plan.session_id, 0)?;
+                    if let Some((previous, plan, certificate, expected_epoch)) = commit {
+                        self.finalize_session_commit(
+                            value.header.session_id,
+                            &previous,
+                            &plan,
+                            certificate.as_ref(),
+                            expected_epoch,
+                        )
+                        .await?;
                         let commit = SessionCommit {
                             header: self.session_header(plan.session_id, plan.epoch),
+                            coordinator_term: certificate
+                                .as_ref()
+                                .map_or(0, |certificate| certificate.term),
                             plan_hash: plan.canonical_hash(),
                         };
                         let wire = wire::SessionCommit::from(&commit);
@@ -1218,34 +2381,80 @@ mod quic_runtime {
                     }
                 }
                 ControlMessage::SessionCommit(value) => {
-                    {
+                    let duplicate_committed_commit = {
+                        let sessions = self.sessions.lock().await;
+                        let session = sessions
+                            .get(&value.header.session_id)
+                            .ok_or(NetworkSessionError::NotFound)?;
+                        session.machine.state() == SessionState::Active
+                            && session.coordinator_device == peer
+                            && session.machine.coordinator_term() == value.coordinator_term
+                            && session.machine.plan().epoch == value.header.expected_epoch
+                            && session.machine.plan().canonical_hash() == value.plan_hash
+                    };
+                    if duplicate_committed_commit {
+                        self.security
+                            .lock()
+                            .await
+                            .complete(value.header.operation_id, Vec::new())?;
+                        return Ok(());
+                    }
+                    let commit = {
                         let mut sessions = self.sessions.lock().await;
                         let session = sessions
                             .get_mut(&value.header.session_id)
                             .ok_or(NetworkSessionError::NotFound)?;
-                        if session.coordinator_device != peer
-                            || session.machine.plan().canonical_hash() != value.plan_hash
+                        if session.coordinator_device != peer {
+                            return Err(NetworkSessionError::InvalidControl);
+                        }
+                        let Some(next) = session.machine.pending_plan().cloned() else {
+                            return Err(NetworkSessionError::InvalidControl);
+                        };
+                        if next.canonical_hash() != value.plan_hash
+                            || value.coordinator_term != session.machine.coordinator_term()
                         {
                             return Err(NetworkSessionError::InvalidControl);
                         }
-                        let plan = session.machine.plan().clone();
-                        for device in participant_devices_including_local(&plan) {
+                        let previous = session.machine.plan().clone();
+                        let term = session.machine.coordinator_term();
+                        for device in participant_devices_including_local(&next) {
                             ready_device_participants(
                                 &mut session.machine,
-                                &plan,
+                                &next,
                                 device,
+                                term,
                                 value.plan_hash,
                                 None,
                             )?;
                         }
                         session.machine.apply(SessionEvent::Commit {
                             operation_id: value.header.operation_id,
+                            term,
                             plan_hash: value.plan_hash,
                         })?;
-                    }
-                    let mut security = self.security.lock().await;
-                    security.advance_session_epoch(value.header.session_id, 0)?;
-                    security.complete(value.header.operation_id, Vec::new())?;
+                        (
+                            previous.clone(),
+                            next,
+                            session.certificate.clone(),
+                            if session.certificate.is_some() {
+                                previous.epoch
+                            } else {
+                                0
+                            },
+                        )
+                    };
+                    self.security
+                        .lock()
+                        .await
+                        .complete(value.header.operation_id, Vec::new())?;
+                    self.finalize_session_commit(
+                        value.header.session_id,
+                        &commit.0,
+                        &commit.1,
+                        commit.2.as_ref(),
+                        commit.3,
+                    )
+                    .await?;
                 }
                 _ => {}
             }
@@ -1836,12 +3045,133 @@ mod quic_runtime {
         }
     }
 
+    include!("messages.rs");
+
     fn coordinator_device(plan: &SessionPlan) -> Result<DeviceId, NetworkSessionError> {
         plan.participants
             .iter()
             .find(|participant| participant.id == plan.coordinator)
             .map(|participant| participant.device_id)
             .ok_or(NetworkSessionError::MissingParticipant)
+    }
+
+    fn canonical_participant(
+        plan: &SessionPlan,
+        device: DeviceId,
+    ) -> Option<fabric_core::ParticipantId> {
+        plan.participants
+            .iter()
+            .filter(|participant| participant.device_id == device)
+            .map(|participant| participant.id)
+            .min()
+    }
+
+    fn device_for_participant(
+        plan: &SessionPlan,
+        participant_id: fabric_core::ParticipantId,
+    ) -> Option<DeviceId> {
+        plan.participants
+            .iter()
+            .find(|participant| participant.id == participant_id)
+            .map(|participant| participant.device_id)
+    }
+
+    fn election_candidate_rank(plan: &SessionPlan, device: DeviceId) -> Option<usize> {
+        let devices = participant_devices_including_local(plan)
+            .into_iter()
+            .collect::<Vec<_>>();
+        devices.iter().position(|candidate| *candidate == device)
+    }
+
+    fn elapsed_since(now: tokio::time::Instant, then: tokio::time::Instant) -> Duration {
+        now.checked_duration_since(then).unwrap_or_default()
+    }
+
+    fn random_election_jitter() -> Duration {
+        let mut random = OsRng;
+        Duration::from_millis(u64::from(random.next_u32() % 1_000))
+    }
+
+    fn vote_record_to_protocol(vote: &ElectionVote) -> CoordinatorElectionVoteRecord {
+        CoordinatorElectionVoteRecord {
+            term: vote.term,
+            membership_hash: vote.membership_hash,
+            committed_epoch: vote.committed_epoch,
+            committed_plan_hash: vote.committed_plan_hash,
+            candidate: vote.candidate,
+            voter: vote.voter,
+            voter_device: vote.voter_device,
+            voter_public_key: vote.voter_public_key,
+            signature: vote.signature,
+        }
+    }
+
+    fn vote_from_protocol(
+        session_id: SessionId,
+        vote: CoordinatorElectionVoteRecord,
+    ) -> ElectionVote {
+        ElectionVote {
+            session_id,
+            term: vote.term,
+            membership_hash: vote.membership_hash,
+            committed_epoch: vote.committed_epoch,
+            committed_plan_hash: vote.committed_plan_hash,
+            candidate: vote.candidate,
+            voter: vote.voter,
+            voter_device: vote.voter_device,
+            voter_public_key: vote.voter_public_key,
+            signature: vote.signature,
+        }
+    }
+
+    fn request_from_protocol(value: &CoordinatorElectionRequest) -> VoteRequest {
+        VoteRequest {
+            session_id: value.header.session_id,
+            term: value.term,
+            membership_hash: value.membership_hash,
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: value.committed_plan_hash,
+            candidate: value.candidate,
+            candidate_device: value.candidate_device,
+            candidate_public_key: value.candidate_public_key,
+            signature: value.signature,
+        }
+    }
+
+    fn certificate_from_protocol(value: &CoordinatorElectionCertificate) -> ElectionCertificate {
+        ElectionCertificate {
+            session_id: value.header.session_id,
+            term: value.term,
+            membership_hash: value.membership_hash,
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: value.committed_plan_hash,
+            candidate: value.candidate,
+            votes: value
+                .votes
+                .iter()
+                .cloned()
+                .map(|vote| vote_from_protocol(value.header.session_id, vote))
+                .collect(),
+        }
+    }
+
+    fn certificate_to_protocol(
+        header: SessionControlHeader,
+        certificate: &ElectionCertificate,
+    ) -> CoordinatorElectionCertificate {
+        CoordinatorElectionCertificate {
+            header,
+            term: certificate.term,
+            membership_hash: certificate.membership_hash,
+            committed_epoch: certificate.committed_epoch,
+            committed_plan_hash: certificate.committed_plan_hash,
+            candidate: certificate.candidate,
+            votes: certificate
+                .votes
+                .iter()
+                .map(vote_record_to_protocol)
+                .collect(),
+        }
     }
 
     fn participant_devices(plan: &SessionPlan, excluding: DeviceId) -> BTreeSet<DeviceId> {
@@ -1891,6 +3221,7 @@ mod quic_runtime {
         machine: &mut SessionMachine,
         plan: &SessionPlan,
         device: DeviceId,
+        term: u64,
         plan_hash: [u8; 32],
         first_operation: Option<OperationId>,
     ) -> Result<(), NetworkSessionError> {
@@ -1910,6 +3241,7 @@ mod quic_runtime {
                     OperationId::new()
                 },
                 participant: participant.id,
+                term,
                 plan_hash,
             })?;
         }
@@ -1949,18 +3281,21 @@ mod quic_runtime {
         accept_task: Option<JoinHandle<()>>,
         dial_task: Option<JoinHandle<()>>,
         relay_task: Option<JoinHandle<()>>,
+        election_task: Option<JoinHandle<()>>,
     }
 
     impl QuicRuntime {
         #[must_use]
         pub fn new(services: Arc<LinkServices>, candidates: Option<Arc<CandidateStore>>) -> Self {
+            let trust = services.endpoint.trust_store();
             Self {
                 services,
                 candidates,
-                relay_trust: None,
+                relay_trust: Some(trust),
                 accept_task: None,
                 dial_task: None,
                 relay_task: None,
+                election_task: None,
             }
         }
 
@@ -1981,6 +3316,10 @@ mod quic_runtime {
     const RELAY_DIAL_INTERVAL: Duration = Duration::from_secs(10);
     /// Per-attempt timeout for a relay dial.
     const RELAY_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+    const COORDINATOR_TICK_INTERVAL: Duration = Duration::from_millis(250);
+    const COORDINATOR_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+    const COORDINATOR_FAILURE_TIMEOUT: Duration = Duration::from_secs(9);
+    const COORDINATOR_CANDIDATE_STAGGER: Duration = Duration::from_secs(3);
 
     /// One relay-dialer sweep: dial every trusted device that has no active
     /// link, and start a punch toward each so the path can upgrade to direct.
@@ -2018,9 +3357,13 @@ mod quic_runtime {
         }
 
         async fn start(&mut self) -> Result<(), String> {
-            if self.accept_task.is_some() || self.dial_task.is_some() {
+            if self.accept_task.is_some()
+                || self.dial_task.is_some()
+                || self.election_task.is_some()
+            {
                 return Err("QUIC runtime is already running".into());
             }
+            self.services.restore_coordinator_sessions().await?;
             let services = Arc::clone(&self.services);
             self.accept_task = Some(tokio::spawn(async move {
                 loop {
@@ -2053,6 +3396,16 @@ mod quic_runtime {
                     }
                 }));
             }
+            let services = Arc::clone(&self.services);
+            self.election_task = Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(COORDINATOR_TICK_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    services
+                        .tick_coordinator_elections(tokio::time::Instant::now())
+                        .await;
+                }
+            }));
             Ok(())
         }
 
@@ -2067,6 +3420,10 @@ mod quic_runtime {
                 let _ = task.await;
             }
             if let Some(task) = self.relay_task.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            if let Some(task) = self.election_task.take() {
                 task.abort();
                 let _ = task.await;
             }
@@ -2085,7 +3442,6 @@ mod quic_runtime {
         let mut changes = candidates.subscribe();
         let mut retry = tokio::time::interval(Duration::from_secs(2));
         let mut backoff = BTreeMap::<SocketAddr, tokio::time::Instant>::new();
-        let mut first_seen = BTreeMap::<SocketAddr, tokio::time::Instant>::new();
         let mut connected = BTreeMap::<SocketAddr, DeviceId>::new();
         loop {
             tokio::select! {
@@ -2110,10 +3466,6 @@ mod quic_runtime {
                     ConnectionHint::Opaque(value) => decode_quic_socket_hint(&value),
                 })
                 .collect::<BTreeSet<_>>();
-            first_seen.retain(|address, _| addresses.contains(address));
-            for address in &addresses {
-                first_seen.entry(*address).or_insert(now);
-            }
             let trusted = trust
                 .as_ref()
                 .and_then(|store| store.entries().ok())
@@ -2137,12 +3489,7 @@ mod quic_runtime {
                 }
                 let mut should_dial = false;
                 for device in &trusted {
-                    if services.link(*device).await.is_none()
-                        && (services.endpoint.device_id() > *device
-                            || first_seen.get(&address).is_some_and(|seen| {
-                                now.duration_since(*seen) >= Duration::from_secs(12)
-                            }))
-                    {
+                    if services.link(*device).await.is_none() {
                         should_dial = true;
                         break;
                     }
@@ -2232,8 +3579,13 @@ async fn build_link_services(
     }
     .map_err(|error| HubError::Component(error.to_string()))?;
 
-    LinkServices::with_registry(Arc::new(endpoint), hub.registry(), 1_024)
-        .map_err(|error| HubError::Component(error.to_string()))
+    LinkServices::with_registry_and_database(
+        Arc::new(endpoint),
+        hub.registry(),
+        1_024,
+        &hub.config().database_path,
+    )
+    .map_err(HubError::Component)
 }
 
 #[cfg(any(feature = "mdns", feature = "ble", feature = "wifi-aware"))]
@@ -2716,6 +4068,112 @@ mod tests {
     }
 
     #[cfg(feature = "quic")]
+    fn add_message_channel(plan: &mut fabric_core::SessionPlan) {
+        use fabric_core::*;
+        let ports: Vec<_> = plan
+            .participants
+            .iter_mut()
+            .map(|p| {
+                let port = PortId::new();
+                p.port_bindings.push(PortBinding {
+                    id: port,
+                    declaration_id: "messages".into(),
+                });
+                PortRef {
+                    participant: p.id,
+                    port,
+                }
+            })
+            .collect();
+        plan.channels.push(ChannelBinding {
+            id: ChannelId::new(),
+            sources: ports.clone(),
+            destinations: ports,
+            contract: ChannelContract {
+                mode: PortMode::ReliableMessages,
+                delivery: DeliverySemantics::ReliableOrdered,
+                priority: 1,
+                max_message_bytes: Some(4096),
+                max_buffered_bytes: 8192,
+                latency_target_ms: None,
+                idle_timeout_ms: None,
+                fanout: FanoutPolicy::All,
+                payload_security: PayloadSecurity::HubReadable,
+                timing: TimingPolicy::None,
+            },
+        });
+    }
+
+    #[cfg(feature = "quic")]
+    fn message_test_authority(
+        plan: &fabric_core::SessionPlan,
+        index: usize,
+        peer: fabric_core::DeviceId,
+    ) -> (
+        Arc<HubIpcServer>,
+        Arc<std::sync::Mutex<fabric_policy::PolicyEngine>>,
+        MessagePortRequest,
+    ) {
+        use fabric_core::*;
+        struct Credentials(AppPrincipal);
+        impl OsCredentialAdapter for Credentials {
+            fn authenticate(&self, _: &PeerCredentials) -> Result<AppPrincipal, IdentityError> {
+                Ok(self.0.clone())
+            }
+        }
+        let p = &plan.participants[index];
+        let ipc = Arc::new(HubIpcServer::new(
+            SharedCredentialAdapter::new(Arc::new(Credentials(p.app_principal.clone()))),
+            Arc::new(Registry::new()),
+        ));
+        let credentials = PeerCredentials {
+            platform: Platform::Test,
+            stable_app_id: p.app_principal.stable_app_id.clone(),
+            publisher_id: None,
+            signing_digest: None,
+            os_subject: p.app_principal.os_subject.clone(),
+        };
+        let (connection, _) = ipc
+            .connect_authenticated(&credentials, ConnectionQuota::default())
+            .unwrap();
+        let mut ability = offer(OfferVisibility::TrustedDevices);
+        ability.instance_id = p.ability_instance;
+        ipc.publish_offer(connection, ability, 0).unwrap();
+        let grant = CapabilityGrantId::new();
+        let port = p.port_bindings[0].id;
+        let mut policy = fabric_policy::PolicyEngine::new(Vec::new());
+        policy.issue_grant(fabric_policy::CapabilityGrant {
+            id: grant,
+            session_id: plan.session_id,
+            participant_id: p.id,
+            ports: [port].into(),
+            actions: [
+                fabric_policy::CapabilityAction::Open,
+                fabric_policy::CapabilityAction::Send,
+                fabric_policy::CapabilityAction::Receive,
+            ]
+            .into(),
+            epoch: plan.epoch,
+            expires_at_ms: u64::MAX,
+            maximum_buffered_bytes: 8192,
+            policy_snapshot: plan.policy_snapshot,
+        });
+        (
+            ipc,
+            Arc::new(std::sync::Mutex::new(policy)),
+            MessagePortRequest {
+                connection,
+                session: plan.session_id,
+                channel: plan.channels[0].id,
+                participant: p.id,
+                port,
+                grant,
+                peer,
+            },
+        )
+    }
+
+    #[cfg(feature = "quic")]
     fn network_plan(
         coordinator: fabric_core::DeviceId,
         participant: fabric_core::DeviceId,
@@ -2756,6 +4214,223 @@ mod tests {
             extensions: SessionExtensions::default(),
             policy_snapshot: PolicySnapshotId::new(),
         }
+    }
+
+    #[cfg(feature = "quic")]
+    fn three_member_network_plan(
+        coordinator: fabric_core::DeviceId,
+        first_peer: fabric_core::DeviceId,
+        second_peer: fabric_core::DeviceId,
+    ) -> fabric_core::SessionPlan {
+        use fabric_core::{Participant, RoleId};
+
+        let mut plan = network_plan(coordinator, first_peer);
+        let template_app = plan.participants[1].app_principal.clone();
+        plan.participants.push(Participant {
+            id: fabric_core::ParticipantId::new(),
+            device_id: second_peer,
+            app_principal: fabric_core::AppPrincipal {
+                stable_app_id: "test.second-participant".into(),
+                ..template_app
+            },
+            ability_instance: fabric_core::AbilityInstanceId::new(),
+            role: RoleId::new("second-participant").unwrap(),
+            port_bindings: Vec::new(),
+        });
+        plan
+    }
+
+    #[cfg(feature = "quic")]
+    async fn wait_for_network_session_state(
+        services: &[Arc<LinkServices>],
+        session_id: fabric_core::SessionId,
+        expected: fabric_core::SessionState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let mut all_ready = true;
+                for service in services {
+                    all_ready &= service.network_session_state(session_id).await == Some(expected);
+                }
+                if all_ready {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "quic")]
+    async fn wait_for_network_coordinator(
+        services: &[Arc<LinkServices>],
+        session_id: fabric_core::SessionId,
+        coordinator: fabric_core::DeviceId,
+        term: u64,
+        epoch: u64,
+    ) {
+        let result = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let mut converged = true;
+                for service in services {
+                    let state = service.network_session_state(session_id).await;
+                    let leader = service.network_session_coordinator(session_id).await;
+                    let plan = service.network_session_plan_for_test(session_id).await;
+                    converged &= state == Some(fabric_core::SessionState::Active)
+                        && leader.is_some_and(|(_, device, current_term)| {
+                            device == coordinator && current_term == term
+                        })
+                        && plan.is_some_and(|value| value.epoch == epoch);
+                }
+                if converged {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            let mut snapshots = Vec::new();
+            for service in services {
+                snapshots.push((
+                    service.local_device_id(),
+                    service
+                        .active_peers()
+                        .await
+                        .into_iter()
+                        .map(|peer| peer.device_id)
+                        .collect::<Vec<_>>(),
+                    service.network_session_state(session_id).await,
+                    service.network_session_coordinator(session_id).await,
+                    service
+                        .network_session_plan_for_test(session_id)
+                        .await
+                        .map(|plan| plan.epoch),
+                    service.election_state_for_test(session_id).await,
+                ));
+            }
+            panic!("coordinator election did not converge: {snapshots:?}");
+        }
+    }
+
+    #[cfg(feature = "quic")]
+    async fn wait_for_network_reconfiguration(
+        services: &[Arc<LinkServices>],
+        session_id: fabric_core::SessionId,
+        coordinator: fabric_core::DeviceId,
+        term: u64,
+        committed_epoch: u64,
+    ) {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let mut transitioning = true;
+                for service in services {
+                    let state = service.network_session_state(session_id).await;
+                    let leader = service.network_session_coordinator(session_id).await;
+                    let plan = service.network_session_plan_for_test(session_id).await;
+                    transitioning &= state == Some(fabric_core::SessionState::Reconfiguring)
+                        && leader.is_some_and(|(_, device, current_term)| {
+                            device == coordinator && current_term == term
+                        })
+                        && plan.is_some_and(|value| value.epoch == committed_epoch);
+                }
+                if transitioning {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(feature = "quic")]
+    async fn send_session_prepare_for_test(
+        from: &LinkServices,
+        peer: fabric_core::DeviceId,
+        sender: fabric_core::DeviceId,
+        plan: &fabric_core::SessionPlan,
+        coordinator_term: u64,
+        nonce: u8,
+        request_id: u64,
+    ) {
+        use bytes::Bytes;
+        use fabric_link::FabricLink;
+        use fabric_protocol::{
+            ControlFrame, MESSAGE_NONCE_BYTES, SessionControlHeader, SessionPrepare, wire,
+        };
+
+        let prepare = SessionPrepare {
+            header: SessionControlHeader {
+                operation_id: fabric_core::OperationId::new(),
+                session_id: plan.session_id,
+                expected_epoch: plan.epoch,
+                sender_device_id: sender,
+                message_nonce: [nonce; MESSAGE_NONCE_BYTES],
+            },
+            coordinator_term,
+            encoded_final_plan: serde_json::to_vec(plan).unwrap(),
+            plan_hash: plan.canonical_hash(),
+        };
+        let encoded = ControlFrame::new(
+            wire::MessageType::SessionPrepare,
+            request_id,
+            &wire::SessionPrepare::from(&prepare),
+        )
+        .unwrap()
+        .encode();
+        from.link(peer)
+            .await
+            .unwrap()
+            .send_control(Bytes::from(encoded))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "quic")]
+    async fn send_stale_election_heartbeat_for_test(
+        from: &LinkServices,
+        peer: fabric_core::DeviceId,
+        committed_plan: &fabric_core::SessionPlan,
+        header_epoch: u64,
+        term: u64,
+        coordinator: fabric_core::ParticipantId,
+        nonce: u8,
+        request_id: u64,
+    ) {
+        use bytes::Bytes;
+        use fabric_link::FabricLink;
+        use fabric_protocol::{
+            ControlFrame, CoordinatorElectionHeartbeat, MESSAGE_NONCE_BYTES, SessionControlHeader,
+            wire,
+        };
+
+        let heartbeat = CoordinatorElectionHeartbeat {
+            header: SessionControlHeader {
+                operation_id: fabric_core::OperationId::new(),
+                session_id: committed_plan.session_id,
+                expected_epoch: header_epoch,
+                sender_device_id: from.local_device_id(),
+                message_nonce: [nonce; MESSAGE_NONCE_BYTES],
+            },
+            term,
+            coordinator,
+            committed_plan_hash: committed_plan.canonical_hash(),
+        };
+        let encoded = ControlFrame::new(
+            wire::MessageType::CoordinatorElectionHeartbeat,
+            request_id,
+            &wire::CoordinatorElectionHeartbeat::from(&heartbeat),
+        )
+        .unwrap()
+        .encode();
+        from.link(peer)
+            .await
+            .unwrap()
+            .send_control(Bytes::from(encoded))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2987,8 +4662,13 @@ mod tests {
         right_runtime.start().await.unwrap();
         left.connect(right.local_addr().unwrap()).await.unwrap();
 
-        let plan = network_plan(left_identity.device_id(), right_identity.device_id());
-        let session_id = left.propose_network_session(plan).await.unwrap();
+        let mut plan = network_plan(left_identity.device_id(), right_identity.device_id());
+        add_message_channel(&mut plan);
+        let (left_ipc, left_policy, left_request) =
+            message_test_authority(&plan, 0, right_identity.device_id());
+        let (right_ipc, right_policy, right_request) =
+            message_test_authority(&plan, 1, left_identity.device_id());
+        let session_id = left.propose_network_session(plan.clone()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if right.network_session_state(session_id).await
@@ -3023,6 +4703,59 @@ mod tests {
             left.active_links().await,
             right.active_links().await
         );
+
+        // Public admission cannot open a caller-invented Session, grant, or
+        // participant even when the carrier itself is authenticated.
+        let mut forged = left_request.clone();
+        forged.session = fabric_core::SessionId::new();
+        assert!(matches!(
+            left.open_message_port(left_ipc.clone(), left_policy.clone(), forged, true)
+                .await,
+            Err(fabric_sdk::FabricError::StaleSession)
+        ));
+        let mut forged = left_request.clone();
+        forged.connection = fabric_core::ConnectionId::new();
+        assert!(matches!(
+            left.open_message_port(left_ipc.clone(), left_policy.clone(), forged, true)
+                .await,
+            Err(fabric_sdk::FabricError::PermissionDenied)
+        ));
+        let (right_port, left_port) = tokio::join!(
+            right.open_message_port(
+                right_ipc.clone(),
+                right_policy.clone(),
+                right_request,
+                false
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                left.open_message_port(left_ipc.clone(), left_policy.clone(), left_request, true)
+                    .await
+            }
+        );
+        let right_port = right_port.unwrap();
+        let left_port = left_port.unwrap();
+        let request = Bytes::from_static(b"synthetic app network configuration");
+        left_port.send(request.clone()).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), right_port.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.payload, request);
+        assert_eq!(received.sender, plan.participants[0].id);
+        right_port
+            .send(Bytes::from_static(b"application result"))
+            .await
+            .unwrap();
+        assert_eq!(
+            left_port.receive().await.unwrap().payload,
+            Bytes::from_static(b"application result")
+        );
+        left_policy.lock().unwrap().replace_rules(Vec::new());
+        assert!(matches!(
+            left_port.send(Bytes::from_static(b"revoked")).await,
+            Err(fabric_sdk::FabricError::PermissionDenied)
+        ));
 
         let mut accepted = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -3059,6 +4792,324 @@ mod tests {
 
         left_runtime.shutdown().await.unwrap();
         right_runtime.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn three_member_quic_session_elects_after_coordinator_loss_and_fences_old_term() {
+        use fabric_identity::{DeviceTrust, DeviceTrustStore};
+        use fabric_storage::Storage;
+
+        let (endpoint_a, identity_a, trust_a) = endpoint(71);
+        let (endpoint_b, identity_b, trust_b) = endpoint(72);
+        let (endpoint_c, identity_c, trust_c) = endpoint(73);
+        let identities = [&identity_a, &identity_b, &identity_c];
+        let trust_stores = [&trust_a, &trust_b, &trust_c];
+        for (index, trust) in trust_stores.iter().enumerate() {
+            for (peer_index, identity) in identities.iter().enumerate() {
+                if index != peer_index {
+                    trust
+                        .set_trust(identity.device_id(), DeviceTrust::Trusted)
+                        .unwrap();
+                }
+            }
+        }
+
+        let database_paths = (0..3)
+            .map(|index| {
+                std::env::temp_dir().join(format!(
+                    "fabric-hub-election-{}-{}-{index}.sqlite",
+                    std::process::id(),
+                    now_ms()
+                ))
+            })
+            .collect::<Vec<_>>();
+        let services = vec![
+            LinkServices::with_registry_and_database(
+                endpoint_a,
+                Arc::new(Registry::new()),
+                32,
+                &database_paths[0],
+            )
+            .unwrap(),
+            LinkServices::with_registry_and_database(
+                endpoint_b,
+                Arc::new(Registry::new()),
+                32,
+                &database_paths[1],
+            )
+            .unwrap(),
+            LinkServices::with_registry_and_database(
+                endpoint_c,
+                Arc::new(Registry::new()),
+                32,
+                &database_paths[2],
+            )
+            .unwrap(),
+        ];
+        let mut runtimes = services
+            .iter()
+            .map(|service| QuicRuntime::new(Arc::clone(service), None))
+            .collect::<Vec<_>>();
+        for runtime in &mut runtimes {
+            runtime.start().await.unwrap();
+        }
+
+        services[0]
+            .connect(services[1].local_addr().unwrap())
+            .await
+            .unwrap();
+        services[0]
+            .connect(services[2].local_addr().unwrap())
+            .await
+            .unwrap();
+        services[1]
+            .connect(services[2].local_addr().unwrap())
+            .await
+            .unwrap();
+        for service in &services {
+            wait_for_link_count(service, 2).await;
+            assert!(
+                service
+                    .active_peers()
+                    .await
+                    .iter()
+                    .all(|peer| peer.trust == DeviceTrust::Trusted)
+            );
+        }
+
+        let mut ordered_devices = identities
+            .iter()
+            .map(|identity| identity.device_id())
+            .collect::<Vec<_>>();
+        ordered_devices.sort();
+        let old_coordinator = ordered_devices[2];
+        let new_coordinator = ordered_devices[0];
+        let remaining_member = ordered_devices[1];
+        let old_index = services
+            .iter()
+            .position(|service| service.local_device_id() == old_coordinator)
+            .unwrap();
+        let new_index = services
+            .iter()
+            .position(|service| service.local_device_id() == new_coordinator)
+            .unwrap();
+        let remaining_index = services
+            .iter()
+            .position(|service| service.local_device_id() == remaining_member)
+            .unwrap();
+
+        let plan = three_member_network_plan(old_coordinator, remaining_member, new_coordinator);
+        for service in &services {
+            assert!(service.election_supported_for_test(&plan).await);
+        }
+        let session_id = services[old_index]
+            .propose_network_session(plan.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let mut negotiating = true;
+                for index in [new_index, remaining_index] {
+                    negotiating &= services[index].network_session_state(session_id).await
+                        == Some(fabric_core::SessionState::Negotiating);
+                }
+                if negotiating {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        services[new_index]
+            .accept_network_session(session_id)
+            .await
+            .unwrap();
+        services[remaining_index]
+            .accept_network_session(session_id)
+            .await
+            .unwrap();
+        wait_for_network_session_state(&services, session_id, fabric_core::SessionState::Active)
+            .await;
+
+        let new_coordinator_participant = plan
+            .participants
+            .iter()
+            .find(|participant| participant.device_id == new_coordinator)
+            .unwrap()
+            .id;
+        services[old_index].disconnect_peer(new_coordinator).await;
+        services[old_index].disconnect_peer(remaining_member).await;
+        wait_for_link_count(&services[new_index], 1).await;
+        wait_for_link_count(&services[remaining_index], 1).await;
+        assert!(
+            services[new_index]
+                .age_coordinator_contact_for_test(session_id, Duration::from_secs(60))
+                .await
+        );
+
+        let survivors = vec![
+            Arc::clone(&services[new_index]),
+            Arc::clone(&services[remaining_index]),
+        ];
+        wait_for_network_reconfiguration(&survivors, session_id, new_coordinator, 1, 1).await;
+        assert_eq!(
+            services[old_index]
+                .network_session_coordinator(session_id)
+                .await
+                .unwrap()
+                .2,
+            0,
+            "the disconnected old coordinator must remain on its stale term"
+        );
+        let old_checkpoint = Storage::open(&database_paths[old_index])
+            .unwrap()
+            .load_session_checkpoint(session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_checkpoint.plan.epoch, 1);
+        assert_eq!(old_checkpoint.election.term, 0);
+        assert_eq!(old_checkpoint.election.voted_for, None);
+        for index in [new_index, remaining_index] {
+            let storage = Storage::open(&database_paths[index]).unwrap();
+            let checkpoint = storage
+                .load_session_checkpoint(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(checkpoint.plan.epoch, 1);
+            assert_eq!(checkpoint.election.term, 1);
+            assert_eq!(
+                checkpoint.election.voted_for,
+                Some(new_coordinator_participant)
+            );
+            assert_eq!(storage.load_election_certificate(session_id).unwrap(), None);
+        }
+
+        services[old_index]
+            .connect(services[remaining_index].local_addr().unwrap())
+            .await
+            .unwrap();
+        wait_for_link_count(&services[old_index], 1).await;
+        wait_for_link_count(&services[remaining_index], 2).await;
+        let mut old_term_plan = plan.clone();
+        old_term_plan.epoch = 2;
+        send_session_prepare_for_test(
+            &services[old_index],
+            remaining_member,
+            old_coordinator,
+            &old_term_plan,
+            0,
+            81,
+            8101,
+        )
+        .await;
+        wait_for_link_count(&services[remaining_index], 1).await;
+        assert_eq!(
+            services[remaining_index]
+                .network_session_state(session_id)
+                .await,
+            Some(fabric_core::SessionState::Reconfiguring)
+        );
+
+        services[old_index].disconnect_peer(remaining_member).await;
+        services[new_index]
+            .connect(services[old_index].local_addr().unwrap())
+            .await
+            .unwrap();
+        wait_for_link_count(&services[old_index], 1).await;
+        wait_for_link_count(&services[new_index], 2).await;
+        wait_for_network_coordinator(&services, session_id, new_coordinator, 1, 2).await;
+
+        for index in [new_index, remaining_index, old_index] {
+            let storage = Storage::open(&database_paths[index]).unwrap();
+            let checkpoint = storage
+                .load_session_checkpoint(session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(checkpoint.plan.epoch, 2);
+            assert_eq!(checkpoint.plan.coordinator, new_coordinator_participant);
+            assert_eq!(checkpoint.election.term, 1);
+            assert_eq!(
+                checkpoint.election.voted_for,
+                (index != old_index).then_some(new_coordinator_participant)
+            );
+            assert_eq!(
+                checkpoint.election.committed_plan_hash,
+                checkpoint.plan.canonical_hash()
+            );
+            let certificate = storage
+                .load_election_certificate(session_id)
+                .unwrap()
+                .unwrap();
+            certificate.verify(&plan).unwrap();
+            assert_eq!(certificate.term, 1);
+            assert_eq!(certificate.candidate, new_coordinator_participant);
+            assert!(certificate.votes.len() >= 2);
+        }
+
+        send_stale_election_heartbeat_for_test(
+            &services[new_index],
+            remaining_member,
+            &plan,
+            2,
+            1,
+            new_coordinator_participant,
+            83,
+            8301,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            services[remaining_index].active_peers().await.len(),
+            1,
+            "a delayed same-term heartbeat for epoch 1 must not close the epoch 2 link"
+        );
+        assert_eq!(
+            services[remaining_index]
+                .network_session_state(session_id)
+                .await,
+            Some(fabric_core::SessionState::Active)
+        );
+
+        let mut stale_term_plan = plan.clone();
+        stale_term_plan.epoch = 3;
+        stale_term_plan.coordinator = new_coordinator_participant;
+        send_session_prepare_for_test(
+            &services[new_index],
+            remaining_member,
+            new_coordinator,
+            &stale_term_plan,
+            0,
+            82,
+            8201,
+        )
+        .await;
+        wait_for_link_count(&services[remaining_index], 0).await;
+        assert_eq!(
+            services[remaining_index]
+                .network_session_coordinator(session_id)
+                .await
+                .unwrap(),
+            (new_coordinator_participant, new_coordinator, 1)
+        );
+        assert_eq!(
+            services[remaining_index]
+                .network_session_plan_for_test(session_id)
+                .await
+                .unwrap()
+                .epoch,
+            2
+        );
+
+        for runtime in &mut runtimes {
+            runtime.shutdown().await.unwrap();
+        }
+        drop(runtimes);
+        drop(services);
+        for path in database_paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[cfg(feature = "quic")]

@@ -361,6 +361,7 @@ macro_rules! direct_plan_hash_message {
         #[derive(Clone, Debug, Eq, PartialEq)]
         pub struct $name {
             pub header: SessionControlHeader,
+            pub coordinator_term: u64,
             $(pub $plan: Vec<u8>,)?
             pub plan_hash: [u8; PLAN_HASH_BYTES],
         }
@@ -373,6 +374,7 @@ macro_rules! direct_plan_hash_message {
                     operation_id,
                     session_id,
                     $epoch: value.header.expected_epoch,
+                    coordinator_term: value.coordinator_term,
                     $($plan: value.$plan.clone(),)?
                     plan_hash: value.plan_hash.to_vec(),
                     sender_device_id,
@@ -394,6 +396,7 @@ macro_rules! direct_plan_hash_message {
                         value.message_nonce,
                         $prefix,
                     )?,
+                    coordinator_term: value.coordinator_term,
                     $($plan: bounded_bytes(
                         value.$plan,
                         concat!($prefix, ".", stringify!($plan)),
@@ -1259,6 +1262,294 @@ impl TryFrom<wire::StreamOpen> for StreamOpen {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorElectionVoteRecord {
+    pub term: u64,
+    pub membership_hash: [u8; 32],
+    pub committed_epoch: u64,
+    pub committed_plan_hash: [u8; 32],
+    pub candidate: ParticipantId,
+    pub voter: ParticipantId,
+    pub voter_device: DeviceId,
+    pub voter_public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl From<&CoordinatorElectionVoteRecord> for wire::CoordinatorElectionVoteRecord {
+    fn from(value: &CoordinatorElectionVoteRecord) -> Self {
+        Self {
+            term: value.term,
+            membership_hash: value.membership_hash.to_vec(),
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: value.committed_plan_hash.to_vec(),
+            candidate: Some((&value.candidate).into()),
+            voter: Some((&value.voter).into()),
+            voter_device: Some((&value.voter_device).into()),
+            voter_public_key: value.voter_public_key.to_vec(),
+            signature: value.signature.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<wire::CoordinatorElectionVoteRecord> for CoordinatorElectionVoteRecord {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::CoordinatorElectionVoteRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            term: value.term,
+            membership_hash: exact_array::<32>(
+                value.membership_hash,
+                "coordinator_election_vote.membership_hash",
+            )?,
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: exact_array::<32>(
+                value.committed_plan_hash,
+                "coordinator_election_vote.committed_plan_hash",
+            )?,
+            candidate: value
+                .candidate
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_vote.candidate",
+                ))?
+                .try_into()?,
+            voter: value
+                .voter
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_vote.voter",
+                ))?
+                .try_into()?,
+            voter_device: value
+                .voter_device
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_vote.voter_device",
+                ))?
+                .try_into()?,
+            voter_public_key: exact_array::<32>(
+                value.voter_public_key,
+                "coordinator_election_vote.voter_public_key",
+            )?,
+            signature: exact_array::<64>(value.signature, "coordinator_election_vote.signature")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorElectionRequest {
+    pub header: SessionControlHeader,
+    pub term: u64,
+    pub membership_hash: [u8; 32],
+    pub committed_epoch: u64,
+    pub committed_plan_hash: [u8; 32],
+    pub candidate: ParticipantId,
+    pub candidate_device: DeviceId,
+    pub candidate_public_key: [u8; 32],
+    pub signature: [u8; 64],
+}
+
+impl From<&CoordinatorElectionRequest> for wire::CoordinatorElectionRequest {
+    fn from(value: &CoordinatorElectionRequest) -> Self {
+        Self {
+            header: Some((&value.header).into()),
+            term: value.term,
+            membership_hash: value.membership_hash.to_vec(),
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: value.committed_plan_hash.to_vec(),
+            candidate: Some((&value.candidate).into()),
+            candidate_device: Some((&value.candidate_device).into()),
+            candidate_public_key: value.candidate_public_key.to_vec(),
+            signature: value.signature.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<wire::CoordinatorElectionRequest> for CoordinatorElectionRequest {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::CoordinatorElectionRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: value
+                .header
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_request.header",
+                ))?
+                .try_into()?,
+            term: value.term,
+            membership_hash: exact_array::<32>(
+                value.membership_hash,
+                "coordinator_election_request.membership_hash",
+            )?,
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: exact_array::<32>(
+                value.committed_plan_hash,
+                "coordinator_election_request.committed_plan_hash",
+            )?,
+            candidate: value
+                .candidate
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_request.candidate",
+                ))?
+                .try_into()?,
+            candidate_device: value
+                .candidate_device
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_request.candidate_device",
+                ))?
+                .try_into()?,
+            candidate_public_key: exact_array::<32>(
+                value.candidate_public_key,
+                "coordinator_election_request.candidate_public_key",
+            )?,
+            signature: exact_array::<64>(
+                value.signature,
+                "coordinator_election_request.signature",
+            )?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorElectionVote {
+    pub header: SessionControlHeader,
+    pub vote: CoordinatorElectionVoteRecord,
+}
+
+impl From<&CoordinatorElectionVote> for wire::CoordinatorElectionVote {
+    fn from(value: &CoordinatorElectionVote) -> Self {
+        Self {
+            header: Some((&value.header).into()),
+            vote: Some((&value.vote).into()),
+        }
+    }
+}
+
+impl TryFrom<wire::CoordinatorElectionVote> for CoordinatorElectionVote {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::CoordinatorElectionVote) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: value
+                .header
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_vote.header",
+                ))?
+                .try_into()?,
+            vote: value
+                .vote
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_vote.vote",
+                ))?
+                .try_into()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorElectionCertificate {
+    pub header: SessionControlHeader,
+    pub term: u64,
+    pub membership_hash: [u8; 32],
+    pub committed_epoch: u64,
+    pub committed_plan_hash: [u8; 32],
+    pub candidate: ParticipantId,
+    pub votes: Vec<CoordinatorElectionVoteRecord>,
+}
+
+impl From<&CoordinatorElectionCertificate> for wire::CoordinatorElectionCertificate {
+    fn from(value: &CoordinatorElectionCertificate) -> Self {
+        Self {
+            header: Some((&value.header).into()),
+            term: value.term,
+            membership_hash: value.membership_hash.to_vec(),
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: value.committed_plan_hash.to_vec(),
+            candidate: Some((&value.candidate).into()),
+            votes: value.votes.iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<wire::CoordinatorElectionCertificate> for CoordinatorElectionCertificate {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::CoordinatorElectionCertificate) -> Result<Self, Self::Error> {
+        check_collection_len("coordinator_election_certificate.votes", value.votes.len())?;
+        Ok(Self {
+            header: value
+                .header
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_certificate.header",
+                ))?
+                .try_into()?,
+            term: value.term,
+            membership_hash: exact_array::<32>(
+                value.membership_hash,
+                "coordinator_election_certificate.membership_hash",
+            )?,
+            committed_epoch: value.committed_epoch,
+            committed_plan_hash: exact_array::<32>(
+                value.committed_plan_hash,
+                "coordinator_election_certificate.committed_plan_hash",
+            )?,
+            candidate: value
+                .candidate
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_certificate.candidate",
+                ))?
+                .try_into()?,
+            votes: value
+                .votes
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinatorElectionHeartbeat {
+    pub header: SessionControlHeader,
+    pub term: u64,
+    pub coordinator: ParticipantId,
+    pub committed_plan_hash: [u8; 32],
+}
+
+impl From<&CoordinatorElectionHeartbeat> for wire::CoordinatorElectionHeartbeat {
+    fn from(value: &CoordinatorElectionHeartbeat) -> Self {
+        Self {
+            header: Some((&value.header).into()),
+            term: value.term,
+            coordinator: Some((&value.coordinator).into()),
+            committed_plan_hash: value.committed_plan_hash.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<wire::CoordinatorElectionHeartbeat> for CoordinatorElectionHeartbeat {
+    type Error = ProtocolError;
+
+    fn try_from(value: wire::CoordinatorElectionHeartbeat) -> Result<Self, Self::Error> {
+        Ok(Self {
+            header: value
+                .header
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_heartbeat.header",
+                ))?
+                .try_into()?,
+            term: value.term,
+            coordinator: value
+                .coordinator
+                .ok_or(ProtocolError::MissingField(
+                    "coordinator_election_heartbeat.coordinator",
+                ))?
+                .try_into()?,
+            committed_plan_hash: exact_array::<32>(
+                value.committed_plan_hash,
+                "coordinator_election_heartbeat.committed_plan_hash",
+            )?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fabric_core::{AbilityKey, AbilityName, Namespace};
@@ -1338,6 +1629,7 @@ mod tests {
 
         let prepare = SessionPrepare {
             header: header(),
+            coordinator_term: 3,
             encoded_final_plan: vec![4, 5],
             plan_hash: [6; PLAN_HASH_BYTES],
         };

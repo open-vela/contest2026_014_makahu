@@ -1,12 +1,13 @@
 """Exercise real C JSON validation and bounded BLE fragment assembly."""
+from host_support import PROJECT_ROOT, SDK_ROOT, CC
 from pathlib import Path
 import ctypes as C
 import json
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 app = root / 'app/buffer_app'
-cjson = root.parent / 'apps/netutils/cjson/cJSON'
+cjson = SDK_ROOT / 'apps/netutils/cjson/cJSON'
 class Request(C.Structure):
     _fields_ = [('use_existing_wifi', C.c_int)] + [(k, C.c_char*n) for k,n in [('request_id',33),('phone_id',80),('token',65),('ssid',33),('password',65)]]
 class Frame(C.Structure):
@@ -15,7 +16,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (Path(tmp)/'netutils').mkdir()
     (Path(tmp)/'netutils/cJSON.h').symlink_to(cjson/'cJSON.h')
     so = str(Path(tmp)/'protocol.so')
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fPIC','-shared',
+    subprocess.run([*CC,'-std=c11','-Wall','-Wextra','-Werror','-fPIC','-shared',
                     '-I'+tmp,'-I'+str(cjson),str(app/'buffer_enrollment.c'),str(cjson/'cJSON.c'),'-o',so],check=True)
     lib = C.CDLL(so)
     lib.buffer_enrollment_decode.argtypes=[C.c_char_p,C.c_size_t,C.POINTER(Request)]

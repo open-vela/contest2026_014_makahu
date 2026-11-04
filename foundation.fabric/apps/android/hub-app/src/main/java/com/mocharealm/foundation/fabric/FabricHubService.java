@@ -22,6 +22,7 @@ import android.provider.Settings;
 import android.util.Log;
 
 import com.mocharealm.foundation.fabric.ipc.IFabricAbility;
+import com.mocharealm.foundation.fabric.ipc.IFabricMessageCallback;
 import com.mocharealm.foundation.fabric.ipc.IFabricHub;
 import com.mocharealm.foundation.fabric.ipc.IFabricResultCallback;
 
@@ -55,18 +56,58 @@ public final class FabricHubService extends Service {
     private final Map<String, ProviderRecord> providers = new ConcurrentHashMap<>();
     private final Map<Long, PendingRecord> pending = new ConcurrentHashMap<>();
     private final Map<Long, Integer> remotePending = new ConcurrentHashMap<>();
+    private final Map<String, ApplicationSession> applicationSessions = new ConcurrentHashMap<>();
+    private final Map<String, Integer> legacySessionOwners = new ConcurrentHashMap<>();
+    private final java.util.concurrent.Semaphore sessionOpenSlots = new java.util.concurrent.Semaphore(4);
     private final AtomicLong nextRequestId = new AtomicLong(1L);
     private final AtomicBoolean polling = new AtomicBoolean(false);
     /** Remote invokes only; the poll loops get dedicated threads (they never return). */
     private final ExecutorService remoteExecutor = Executors.newFixedThreadPool(8);
+    private final ExecutorService sessionCleanupExecutor = Executors.newFixedThreadPool(2);
     private final Handler handler = new Handler(Looper.getMainLooper());
     private WifiManager.MulticastLock multicastLock;
     private ConnectivityManager connectivityManager;
     private Network boundWifiNetwork;
     private Thread requestPollThread;
     private Thread streamPollThread;
+    private FabricBleBinderRuntime bleMessages;
 
     private final IFabricHub.Stub binder = new IFabricHub.Stub() {
+        @Override
+        public byte[] localDeviceId() {
+            enforcePermission();
+            if (bleMessages == null) throw new IllegalStateException("BLE identity unavailable");
+            return bleMessages.localDeviceId();
+        }
+
+        @Override
+        public long openBleMessages(String address, byte[] pin, String ability,
+                byte[] channel, byte[] localPort, byte[] peerPort, int maximum,
+                IFabricMessageCallback callback) {
+            enforcePermission(); validateAbility(ability);
+            if (callback == null || channel == null || localPort == null || peerPort == null) {
+                throw new IllegalArgumentException("callback/profile required");
+            }
+            int uid = Binder.getCallingUid();
+            if (!ownsAbility(uid, ability)) throw new SecurityException("caller does not own ability");
+            if (bleMessages == null) throw new IllegalStateException("BLE backend unavailable");
+            return bleMessages.open(uid, address, pin, ability, channel, localPort, peerPort, maximum, callback);
+        }
+        @Override
+        public void confirmBlePairing(long id, int code, boolean accepted) {
+            enforcePermission(); bleMessages.confirm(id, Binder.getCallingUid(), code, accepted);
+        }
+        @Override
+        public boolean sendBleMessage(long id, byte[] payload) {
+            enforcePermission();
+            if (payload == null || payload.length == 0 || payload.length > 12288) return false;
+            return bleMessages.send(id, Binder.getCallingUid(), payload);
+        }
+        @Override
+        public void closeBleMessages(long id) {
+            enforcePermission(); bleMessages.close(id, Binder.getCallingUid());
+        }
+
         @Override
         public void registerAbility(String ability, String packageName, IFabricAbility callback)
                 throws RemoteException {
@@ -224,6 +265,24 @@ public final class FabricHubService extends Service {
         }
 
         @Override
+        public byte[] invocationPeer(long requestId) {
+            enforcePermission();
+            int uid = Binder.getCallingUid();
+            if (requestId < 0L) {
+                Integer selected = remotePending.get(requestId);
+                if (selected == null) return null;
+                if (selected != uid) throw new SecurityException("caller is not the selected provider");
+                byte[] peer = NativeHub.nativeRemoteRequestPeer(requestId);
+                return peer != null && peer.length == 32 ? Arrays.copyOf(peer, 32) : null;
+            }
+            PendingRecord selected = pending.get(requestId);
+            if (selected == null) return null;
+            if (selected.providerUid != uid) throw new SecurityException("caller is not the selected provider");
+            if (android.os.SystemClock.elapsedRealtime() >= selected.expiresAt) return null;
+            return bleMessages == null ? null : bleMessages.localDeviceId();
+        }
+
+        @Override
         public void complete(long requestId, byte[] payload) throws RemoteException {
             enforcePermission();
             validatePayload(payload);
@@ -248,6 +307,10 @@ public final class FabricHubService extends Service {
             if (request.providerUid != Binder.getCallingUid()) {
                 throw new SecurityException("only the selected provider may complete this request");
             }
+            if (android.os.SystemClock.elapsedRealtime() >= request.expiresAt) {
+                timeout(requestId, request);
+                return;
+            }
             if (pending.remove(requestId, request)) {
                 request.callback.onResult(
                         requestId, Arrays.copyOf(payload, payload.length), null);
@@ -268,6 +331,11 @@ public final class FabricHubService extends Service {
                 throw new IllegalArgumentException("deviceIds required");
             }
             byte[] config = configJson == null ? new byte[0] : Arrays.copyOf(configJson, configJson.length);
+            if (config.length > 32768) throw new IllegalArgumentException("Session config exceeds limit");
+            if (config.length > 0) try {
+                if ("application".equals(new org.json.JSONObject(new String(config, java.nio.charset.StandardCharsets.UTF_8)).optString("kind")))
+                    throw new SecurityException("use provider-owned openApplicationSession");
+            } catch (org.json.JSONException ignored) { }
             String sessionId = NativeHub.nativeOpenSession(deviceIds, ability, config);
             if (sessionId == null) {
                 Log.w(TAG, "openSession(" + ability + ") failed: native call returned null");
@@ -277,7 +345,88 @@ public final class FabricHubService extends Service {
                 Log.w(TAG, "openSession(" + ability + ") failed: " + sessionId.substring(1));
                 return "";
             }
+            legacySessionOwners.put(sessionId, Binder.getCallingUid());
             return sessionId;
+        }
+
+        @Override
+        public String openApplicationSession(String[] deviceIds, String ability, byte[] configJson) {
+            enforcePermission(); validateAbility(ability);
+            int uid = Binder.getCallingUid();
+            ProviderRecord provider = providers.get(ability);
+            if (!ownsAbility(uid, ability) || provider == null) throw new SecurityException("caller does not own ability");
+            if (deviceIds == null || deviceIds.length == 0 || deviceIds.length > 64 || configJson == null || configJson.length > 16384)
+                throw new IllegalArgumentException("bounded peers and application binding required");
+            java.util.Set<String> peers = new java.util.TreeSet<>();
+            for (String peer : deviceIds) {
+                if (peer == null || !peer.matches("[0-9a-f]{64}") || !peers.add(peer)) throw new IllegalArgumentException("invalid or duplicate device");
+            }
+            if (applicationSessions.size() >= 128 || !sessionOpenSlots.tryAcquire()) throw new IllegalStateException("Session admission is busy");
+            try {
+                org.json.JSONObject config = new org.json.JSONObject();
+                config.put("kind", "application"); config.put("package", provider.packageName); config.put("uid", uid);
+                config.put("binding_b64", android.util.Base64.encodeToString(configJson, android.util.Base64.NO_WRAP));
+                String id = NativeHub.nativeOpenSession(peers.toArray(new String[0]), ability, config.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                if (id == null || id.isEmpty() || id.startsWith("!")) return "";
+                ApplicationSession session = new ApplicationSession(provider, ability, peers);
+                applicationSessions.put(id, session);
+                if (providers.get(ability) != provider || !provider.callback.asBinder().isBinderAlive()) {
+                    if (applicationSessions.remove(id, session)) NativeHub.nativeCloseSession(id);
+                    return "";
+                }
+                return id;
+            } catch (org.json.JSONException error) { throw new IllegalArgumentException("invalid Session binding", error); }
+            finally { sessionOpenSlots.release(); }
+        }
+
+        @Override
+        public boolean applicationSessionActive(String id) {
+            enforcePermission();
+            ApplicationSession session = applicationSessions.get(id);
+            if (session == null) return false;
+            if (session.provider.uid != Binder.getCallingUid()) throw new SecurityException("Session belongs to another provider");
+            return providers.get(session.ability) == session.provider && session.provider.callback.asBinder().isBinderAlive()
+                && NativeHub.nativeApplicationSessionActive(id);
+        }
+
+        @Override
+        public String invocationSession(long requestId) {
+            enforcePermission();
+            if (requestId >= 0L) return null;
+            Integer provider = remotePending.get(requestId);
+            if (provider == null) return null;
+            if (provider != Binder.getCallingUid()) throw new SecurityException("caller is not the selected provider");
+            String context = NativeHub.nativeRemoteRequestSession(requestId);
+            if (context == null) return null;
+            try {
+                String id = new org.json.JSONObject(context).getString("session_id");
+                return NativeHub.nativeApplicationSessionActive(id) ? context : null;
+            } catch (org.json.JSONException error) { return null; }
+        }
+
+        @Override
+        public long invokeSession(String id, String device, String ability, byte[] payload, IFabricResultCallback callback) {
+            enforcePermission(); validateAbility(ability); validatePayload(payload);
+            ApplicationSession session = applicationSessions.get(id);
+            if (session == null || session.provider.uid != Binder.getCallingUid() || !session.ability.equals(ability)
+                    || !session.peers.contains(device) || providers.get(ability) != session.provider || callback == null)
+                throw new SecurityException("current provider-owned Session required");
+            byte[] copy = Arrays.copyOf(payload, payload.length);
+            long request = nextRequestId.getAndUpdate(value -> value == Long.MAX_VALUE ? 1L : value + 1L);
+            remoteExecutor.execute(() -> {
+                byte[] result = null; String failure = null;
+                try {
+                    if (applicationSessions.get(id) != session || providers.get(ability) != session.provider) throw new IllegalStateException("Session revoked");
+                    result = NativeHub.nativeInvokeSession(id, device, ability, copy);
+                    if (applicationSessions.get(id) != session || providers.get(ability) != session.provider) {
+                        result = null; failure = "Session revoked";
+                    }
+                } catch (RuntimeException error) { failure = error.getMessage(); }
+                finally { Arrays.fill(copy, (byte)0); }
+                try { callback.onResult(request, result, result == null ? (failure == null ? "Session unavailable" : failure) : null); }
+                catch (RemoteException ignored) { }
+            });
+            return request;
         }
 
         @Override
@@ -285,6 +434,16 @@ public final class FabricHubService extends Service {
             enforcePermission();
             if (sessionId == null || sessionId.isEmpty()) {
                 return;
+            }
+            ApplicationSession application = applicationSessions.get(sessionId);
+            if (application != null) {
+                if (application.provider.uid != Binder.getCallingUid()) throw new SecurityException("Session belongs to another provider");
+                applicationSessions.remove(sessionId, application);
+            } else {
+                Integer owner = legacySessionOwners.get(sessionId);
+                if (owner == null) return;
+                if (owner != Binder.getCallingUid()) throw new SecurityException("Session belongs to another caller");
+                legacySessionOwners.remove(sessionId, owner);
             }
             NativeHub.nativeCloseSession(sessionId);
         }
@@ -341,7 +500,10 @@ public final class FabricHubService extends Service {
             multicastLock.acquire();
         }
         bindHubProcessToWifi();
+        preparePrivateFabricStorage();
         NativeHub.nativeStart(this, getFilesDir().getAbsolutePath(), localDeviceLabel(), QUIC_PORT);
+        bleMessages = new FabricBleBinderRuntime(this, getFilesDir().getAbsolutePath(),
+                this::ownsAbility, () -> NativeHub.nativeReloadTrust());
         polling.set(true);
         // Dedicated threads: these loops never return, so running them on
         // remoteExecutor would permanently consume pool slots that remote
@@ -371,6 +533,7 @@ public final class FabricHubService extends Service {
             removeProvider(entry.getKey(), entry.getValue().callback.asBinder());
         }
         pending.clear();
+        if (bleMessages != null) { bleMessages.close(); bleMessages = null; }
         polling.set(false);
         if (requestPollThread != null) {
             requestPollThread.interrupt();
@@ -381,6 +544,7 @@ public final class FabricHubService extends Service {
             streamPollThread = null;
         }
         remoteExecutor.shutdownNow();
+        sessionCleanupExecutor.shutdown();
         remotePending.clear();
         NativeHub.nativeStop();
         if (multicastLock != null && multicastLock.isHeld()) {
@@ -395,6 +559,31 @@ public final class FabricHubService extends Service {
 
     public static int providerCount() {
         return ServiceState.providerCount;
+    }
+
+    private boolean ownsAbility(int uid, String ability) {
+        ProviderRecord provider = providers.get(ability);
+        return provider != null && provider.uid == uid && provider.callback.asBinder().isBinderAlive();
+    }
+
+    private void preparePrivateFabricStorage() {
+        try {
+            android.system.StructStat dir = android.system.Os.lstat(getFilesDir().getAbsolutePath());
+            if (dir.st_uid != android.os.Process.myUid() || !android.system.OsConstants.S_ISDIR(dir.st_mode)) {
+                throw new SecurityException("invalid Fabric state owner");
+            }
+            android.system.Os.chmod(getFilesDir().getAbsolutePath(), 0700);
+            java.io.File key = new java.io.File(getFilesDir(), "fabric-device.key");
+            if (key.exists()) {
+                android.system.StructStat stat = android.system.Os.lstat(key.getAbsolutePath());
+                if (stat.st_uid != android.os.Process.myUid() || !android.system.OsConstants.S_ISREG(stat.st_mode)) {
+                    throw new SecurityException("invalid Fabric key owner");
+                }
+                android.system.Os.chmod(key.getAbsolutePath(), 0600);
+            }
+        } catch (android.system.ErrnoException error) {
+            throw new IllegalStateException("private Fabric storage unavailable", error);
+        }
     }
 
     private int enforceClient(String packageName) {
@@ -505,7 +694,14 @@ public final class FabricHubService extends Service {
             return;
         }
         if (providers.remove(ability, record)) {
+            applicationSessions.forEach((id, session) -> {
+                if (session.provider == record && applicationSessions.remove(id, session)) sessionCleanupExecutor.execute(() -> {
+                    try { NativeHub.nativeCloseSession(id); }
+                    catch (RuntimeException error) { Log.w(TAG, "provider Session cleanup failed", error); }
+                });
+            });
             callbackBinder.unlinkToDeath(record.deathRecipient, 0);
+            if (bleMessages != null) bleMessages.revoke(ability, record.uid);
             NativeHub.nativeUnregisterAbility(ability, record.packageName, record.uid);
             ServiceState.providerCount = providers.size();
         }
@@ -565,7 +761,17 @@ public final class FabricHubService extends Service {
                     NativeHub.nativeCompleteRemote(requestId, null);
                     continue;
                 }
+                byte[] peer = NativeHub.nativeRemoteRequestPeer(requestId);
+                if (peer == null || peer.length != 32) {
+                    NativeHub.nativeCompleteRemote(requestId, null);
+                    continue;
+                }
                 remotePending.put(requestId, provider.uid);
+                handler.postDelayed(() -> {
+                    if (remotePending.remove(requestId, provider.uid)) {
+                        NativeHub.nativeCompleteRemote(requestId, null);
+                    }
+                }, REQUEST_TIMEOUT_MS);
                 try {
                     provider.callback.onInvoke(requestId, payload);
                 } catch (RemoteException error) {
@@ -650,6 +856,16 @@ public final class FabricHubService extends Service {
         getSystemService(NotificationManager.class).createNotificationChannel(channel);
     }
 
+    private static final class ApplicationSession {
+        final ProviderRecord provider;
+        final String ability;
+        final java.util.Set<String> peers;
+        ApplicationSession(ProviderRecord provider, String ability, java.util.Set<String> peers) {
+            this.provider = provider; this.ability = ability;
+            this.peers = java.util.Collections.unmodifiableSet(new java.util.TreeSet<>(peers));
+        }
+    }
+
     private static final class ProviderRecord {
         final String packageName;
         final int uid;
@@ -671,10 +887,12 @@ public final class FabricHubService extends Service {
     private static final class PendingRecord {
         final int providerUid;
         final IFabricResultCallback callback;
+        final long expiresAt;
 
         PendingRecord(int providerUid, IFabricResultCallback callback) {
             this.providerUid = providerUid;
             this.callback = callback;
+            this.expiresAt = android.os.SystemClock.elapsedRealtime() + REQUEST_TIMEOUT_MS;
         }
     }
 

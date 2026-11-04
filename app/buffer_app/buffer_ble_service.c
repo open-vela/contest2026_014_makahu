@@ -8,7 +8,19 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef CONFIG_BUFFER_VELA_BLE
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+#include "buffer_fabric.h"
+int buffer_ble_service_start(void *instance) { return buffer_fabric_service_start(instance); }
+void buffer_ble_service_stop(void) { buffer_fabric_service_stop(); }
+bool buffer_ble_service_busy(void) { return buffer_fabric_busy(); }
+bool buffer_ble_service_claim_lan(void) { return false; }
+void buffer_ble_service_release_lan(void) {}
+void buffer_ble_service_process(void) {}
+void buffer_ble_service_code(char *code, size_t size) {
+  struct buffer_fabric_status_s s; buffer_fabric_snapshot(&s);
+  if (size) { if (s.binding == -ENOENT && s.code >= 0) snprintf(code,size,"%06d",s.code); else code[0]=0; }
+}
+#elif defined(CONFIG_BUFFER_VELA_BLE)
 #include <bluetooth.h>
 #include <bt_adapter.h>
 #include <bt_device.h>

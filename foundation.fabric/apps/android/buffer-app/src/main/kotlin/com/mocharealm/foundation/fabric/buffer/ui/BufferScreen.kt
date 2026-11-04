@@ -1,5 +1,6 @@
 package com.mocharealm.foundation.fabric.buffer.ui
 import com.mocharealm.foundation.fabric.buffer.data.device.VelaPeer
+import com.mocharealm.foundation.fabric.buffer.domain.FocusSession
 import com.mocharealm.foundation.fabric.buffer.domain.FocusReminderConfig
 import com.mocharealm.foundation.fabric.buffer.domain.RabbitHoleSession
 import com.mocharealm.foundation.fabric.buffer.domain.model.BufferCard
@@ -35,7 +36,6 @@ internal fun BufferScreen(
     pendingAudio: List<BufferCapture>,
     textInput: String,
     status: String,
-    bedtimeSchedule: String,
     bridgeRunning: Boolean,
     fabricConnected: Boolean,
     mode: String,
@@ -53,8 +53,6 @@ internal fun BufferScreen(
     onEditCard: (BufferCard, String, String) -> Boolean,
     onDeleteCards: (List<String>) -> Boolean,
     onGenerateWeeklySummary: () -> Unit,
-    onBedtimeScheduleChanged: (String) -> Unit,
-    onSaveBedtimeSchedule: () -> Unit,
     onManualTranscription: (BufferCapture, String) -> Unit,
     onStartRecording: () -> Boolean,
     onStopRecording: () -> Unit,
@@ -70,6 +68,12 @@ internal fun BufferScreen(
     onModeChanged: (String) -> Unit,
     onLoadFocusSettings: () -> FocusReminderConfig,
     onSaveFocusSettings: (FocusReminderConfig) -> Boolean,
+    focusSession: FocusSession?,
+    onFocus: () -> Unit,
+    onFocusHistory: () -> Unit,
+    onSourceHistory: () -> Unit,
+    onFocusCalendar: () -> Unit,
+    onCalendar: () -> Unit,
     researchSession: RabbitHoleSession?,
     onResearch: () -> Unit,
     onResearchRecord: () -> Unit,
@@ -105,9 +109,9 @@ internal fun BufferScreen(
         else -> cards
     }
     val visibleCards = sourceCards.filter { card ->
-        section == "home" || search.isBlank() || card.title.contains(search, true) ||
+        card.state != "pending_transcription" && (section == "home" || search.isBlank() || card.title.contains(search, true) ||
             card.summary.contains(search, true) || card.researchNotes.orEmpty().contains(search, true) ||
-            card.externalLinks.any { it.contains(search, true) } || card.tags.any { it.contains(search, true) }
+            card.externalLinks.any { it.contains(search, true) } || card.tags.any { it.contains(search, true) })
     }
     val allCards = (cards + shelfCards + answerBoxCards + lifeLogCards).distinctBy { it.cardId }
     val associationCandidates = (shelfCards + lifeLogCards).distinctBy { it.cardId }
@@ -184,7 +188,6 @@ internal fun BufferScreen(
                 when (sheet) {
                     "text" -> {
                         Text("记下此刻", style = MaterialTheme.typography.headlineSmall)
-                        Text("不用整理，也不用想好分类。", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         OutlinedTextField(
                             value = textInput, onValueChange = onTextChanged,
                             modifier = Modifier.fillMaxWidth(), minLines = 4,
@@ -192,17 +195,23 @@ internal fun BufferScreen(
                             shape = RoundedCornerShape(20.dp),
                         )
                         Button(onClick = onSaveText, enabled = textInput.isNotBlank(),
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("收好这段想法") }
+                            modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text("保存") }
                     }
                     "audio" -> PendingAudioPanel(pendingAudio, onManualTranscription)
                     "llm" -> BufferLlmSettingsPanel()
+                    "capture_context" -> BufferCaptureContextPanel()
+                    "capabilities" -> BufferCapabilityPanel()
+                    "members" -> BufferMeshMembersPanel()
                     "focus_settings" -> BufferFocusSettingsPanel(onLoadFocusSettings, onSaveFocusSettings) { sheet = null }
-                    "bedtime" -> BedtimeSchedulePanel(bedtimeSchedule, onBedtimeScheduleChanged, onSaveBedtimeSchedule)
+                    "bedtime" -> BedtimePolicyPanel { onAction(it, "later") }
                     "diagnostics" -> StatusPanel(status, bridgeRunning, fabricConnected, mode, pendingCaptures, eventCount, phoneAddress, onToggleBridge)
                 }
                 selectedCard?.let { card ->
                     var more by rememberSaveable(card.cardId) { mutableStateOf(false) }
-                    BufferCardDetailContent(card) { selectedCardId = it }
+                    BufferCardDetailContent(card, { selectedCardId = it }, { onAction(card, "task_schedule") })
+                    if (card.kind in setOf("spark_card", "question_card", "care_card", "weekly_card")) {
+                        BedtimeReadabilityActions(card, onTags)
+                    }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         TextButton(onClick = { more = !more }) { Text(if (more) "收起操作" else "更多操作") }
                         Row {
@@ -273,9 +282,7 @@ internal fun BufferScreen(
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(LocalDate.now().format(java.time.format.DateTimeFormatter.ofPattern("M 月 d 日 · EEEE", Locale.CHINESE)),
                                 style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            Text("先记下，\n不急着处理。", style = MaterialTheme.typography.headlineLarge)
-                            Text("灵感、疑问，或生活里的小事。", style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text("记下此刻", style = MaterialTheme.typography.headlineLarge)
                         }
                     }
                     item {
@@ -285,22 +292,35 @@ internal fun BufferScreen(
                                 OutlinedButton(onClick = { sheet = "text" }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
                                     Icon(BufferIcons.Write, null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.size(8.dp))
-                                    Text("不方便说？写几句话")
+                                    Text("写文字")
                                 }
                             }
                         }
                     }
                     item { BufferRhythmPanel(mode, onModeChanged) { sheet = "focus_settings" } }
-                    if (pendingAudio.isNotEmpty()) item {
-                        BufferActionRow("${pendingAudio.size} 段语音待整理", "原始录音已保存，稍后补充文字也可以", BufferIcons.Mic) { sheet = "audio" }
+                    item {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            focusSession?.let { Text(it.title, style = MaterialTheme.typography.titleMedium) }
+                            Button(onClick = onFocus, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                                Text(if (focusSession?.active == true) "结束并回顾" else if (focusSession?.status == "review_pending") "回顾这次专注" else "开始专注")
+                            }
+                            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                TextButton(onClick = onCalendar) { Text("日历") }
+                                TextButton(onClick = onFocusCalendar) { Text("日程专注") }
+                                TextButton(onClick = onFocusHistory) { Text("专注记录") }
+                            }
+                            TextButton(onClick = onSourceHistory) { Text("原始事件簿") }
+                        }
                     }
-                    item { Text("最近留下的", style = MaterialTheme.typography.titleMedium) }
+                    if (pendingAudio.isNotEmpty()) item {
+                        BufferActionRow("${pendingAudio.size} 段待转写", "", BufferIcons.Mic) { sheet = "audio" }
+                    }
+                    if (visibleCards.isNotEmpty()) item { Text("最近记录", style = MaterialTheme.typography.titleMedium) }
 
                 }
                 if (destination == "library") {
                     item {
                         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                            Text("留住好奇，慢慢生长。", style = MaterialTheme.typography.headlineSmall)
                             BufferExplorationPanel(researchSession, onResearch, onResearchRecord, onResearchHistory)
                             OutlinedTextField(value = search, onValueChange = { search = it },
                                 modifier = Modifier.fillMaxWidth(), placeholder = { Text("找一个想法、问题或标签") },
@@ -315,10 +335,10 @@ internal fun BufferScreen(
                     }
                 }
                 if (destination in listOf("capture", "library")) {
-                    if (visibleCards.isEmpty()) item {
+                    if (visibleCards.isEmpty() && destination == "library") item {
                         BufferEmptyState(
-                            title = if (search.isNotBlank() && destination == "library") "还没找到这个想法" else if (destination == "capture") "这里，留给下一次灵光一现" else "给想法留个位置",
-                            subtitle = if (search.isNotBlank() && destination == "library") "试试另一个词，或换个分类。" else if (mode == "bedtime" && destination == "capture") "今晚没有适合回看的轻量内容。安心休息。" else "记下之后，会在这里慢慢积累。",
+                            title = if (search.isNotBlank() && destination == "library") "未找到记录" else if (destination == "capture") "暂无记录" else "暂无收藏",
+                            subtitle = if (search.isNotBlank() && destination == "library") "试试另一个词，或换个分类。" else if (mode == "bedtime" && destination == "capture") "暂无适合睡前回看的内容。" else "可录音或写文字。",
                         )
                     }
                     items(visibleCards, key = { it.cardId }) { card ->
@@ -335,40 +355,32 @@ internal fun BufferScreen(
                     }
                 }
                 if (destination == "review") {
-                    item {
-                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text("回头看看，\n想法走到了哪里。", style = MaterialTheme.typography.headlineLarge)
-                            Text("无需赶进度，按自己的节奏。", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
                     item { BufferWeekPreview(weeklySummary) { destination = "week" } }
 
                 }
                 if (destination == "week") { item { WeeklySummaryPanel(weeklySummary, onGenerateWeeklySummary) } }
                 if (destination == "devices") {
-                    item { Text("让想法在身边流动。", style = MaterialTheme.typography.headlineSmall) }
-                    item { AddVelaPanel() }
                     item {
-                        var showLegacy by rememberSaveable { mutableStateOf(false) }
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            TextButton(onClick = { showLegacy = !showLegacy }) { Text(if (showLegacy) "收起局域网连接" else "设备已经连上 Wi-Fi？") }
-                            if (showLegacy) PairingPanel(discoveredVelas, pairedVelaIds, pairingCode,
+                        AddVelaPanel(onConfigureAi = { sheet = "llm" }) {
+                            PairingPanel(discoveredVelas, pairedVelaIds, pairingCode,
                                 scanningVelas, pairingVela, onPairingCodeChanged, onScanVelas, onPairVela)
                         }
                     }
                 }
                 if (destination == "settings") {
-                    item { Text("按你的习惯来。", style = MaterialTheme.typography.headlineSmall) }
                     item {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("日常偏好", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            BufferActionRow("睡前时段", bedtimeSchedule.ifBlank { "尚未设置" }, BufferIcons.Leaf) { sheet = "bedtime" }
+                            BufferActionRow("睡前时段", "时间、日程与收束偏好", BufferIcons.Leaf) { sheet = "bedtime" }
+                            BufferActionRow("捕获上下文", "可选位置、日程与设备共享", BufferIcons.Leaf) { sheet = "capture_context" }
                         }
                     }
                     item {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("智能服务", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            BufferActionRow("LLM 服务", "分类、问答与周总结", BufferIcons.Leaf) { sheet = "llm" }
+                            BufferActionRow("AI 服务", "分类、问答与周总结", BufferIcons.Leaf) { sheet = "llm" }
+                            BufferActionRow("能力建议", "审核历史依据、启用与撤销", BufferIcons.Leaf) { sheet = "capabilities" }
+                            BufferActionRow("协作设备", "查询、批准与撤销设备访问", BufferIcons.Leaf) { sheet = "members" }
                         }
                     }
                     item { BufferActionRow("连接与诊断", "查看设备服务状态", bufferDestinations[3].icon) { sheet = "diagnostics" } }

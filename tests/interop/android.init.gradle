@@ -1,0 +1,13 @@
+// Host verification options; production compilation and APK behavior are unchanged.
+allprojects { p ->
+    p.tasks.withType(org.gradle.api.tasks.testing.Test).configureEach {
+        // JBR 21 C2 crashes while compiling instrumented Robolectric code.
+        // Keep all assertions and production code, using the C1 compiler.
+        jvmArgs '-XX:TieredStopAtLevel=1'
+        if (p.hasProperty('bufferSourceInterop')) {
+            systemProperty 'buffer.sourceInterop', p.property('bufferSourceInterop').toString()
+            systemProperty 'buffer.sourceInteropRequireNative', p.findProperty('bufferSourceInteropRequireNative')?.toString() ?: 'false'
+            outputs.upToDateWhen { false }
+        }
+    }
+}

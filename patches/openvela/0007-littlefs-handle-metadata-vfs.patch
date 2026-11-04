@@ -1,0 +1,138 @@
+diff --git a/fs/littlefs/lfs_vfs.c b/fs/littlefs/lfs_vfs.c
+--- a/fs/littlefs/lfs_vfs.c
++++ b/fs/littlefs/lfs_vfs.c
+@@ -745,7 +745,6 @@
+   FAR struct littlefs_file_s *priv;
+   struct littlefs_attr_s attr;
+   FAR struct inode *inode;
+-  FAR char *path;
+   int ret;
+ 
+   memset(buf, 0, sizeof(*buf));
+@@ -756,29 +755,14 @@
+   inode = filep->f_inode;
+   fs    = inode->i_private;
+ 
+-  /* Call LFS to get file size */
+-
+-  path = lib_get_tempbuffer(PATH_MAX);
+-  if (path == NULL)
+-    {
+-      return -ENOMEM;
+-    }
+-
+-  /* Path reconstruction reads directory metadata and the open-file list.
+-   * Hold the same lock used by rename, create and attribute updates. */
+-
+-  ret = nxmutex_lock(&fs->lock);
+-  if (ret < 0)
+-    {
+-      lib_put_tempbuffer(path);
+-      return ret;
+-    }
+-
+-  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
+-                                              PATH_MAX));
+-  if (ret < 0)
+-    {
+-      goto errout;
++  /* Keep the filesystem lock around the handle-based littlefs operations.
++   * Looking up metadata by open file avoids reconstructing its path and
++   * rescanning directory metadata. */
++
++  ret = nxmutex_lock(&fs->lock);
++  if (ret < 0)
++    {
++      return ret;
+     }
+ 
+   buf->st_size = lfs_file_size(&fs->lfs, &priv->file);
+@@ -788,8 +772,8 @@
+       goto errout;
+     }
+ 
+-  ret = littlefs_convert_result(lfs_getattr(&fs->lfs, path, 0, &attr,
+-                                            sizeof(attr)));
++  ret = littlefs_convert_result(lfs_file_getattr(&fs->lfs, &priv->file, 0,
++                                                 &attr, sizeof(attr)));
+   if (ret < 0)
+     {
+       if (ret != -ENODATA && ret != -ENOENT)
+@@ -816,7 +800,6 @@
+                          buf->st_blksize;
+ 
+ errout:
+-  lib_put_tempbuffer(path);
+   nxmutex_unlock(&fs->lock);
+   return ret;
+ }
+@@ -829,7 +812,6 @@
+   FAR struct littlefs_file_s *priv;
+   struct littlefs_attr_s attr;
+   FAR struct inode *inode;
+-  FAR char *path;
+   int ret;
+ 
+   /* Recover our private data from the struct file instance */
+@@ -838,33 +820,16 @@
+   inode = filep->f_inode;
+   fs    = inode->i_private;
+ 
+-  path = lib_get_tempbuffer(PATH_MAX);
+-  if (path == NULL)
+-    {
+-      return -ENOMEM;
+-    }
+-
+-  /* Call LFS to get file size */
+-
+-  /* Path reconstruction reads directory metadata and the open-file list.
+-   * Hold the same lock used by rename, create and attribute updates. */
+-
+-  ret = nxmutex_lock(&fs->lock);
+-  if (ret < 0)
+-    {
+-      lib_put_tempbuffer(path);
+-      return ret;
+-    }
+-
+-  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
+-                                              PATH_MAX));
+-  if (ret < 0)
+-    {
+-      goto errout;
+-    }
+-
+-  ret = littlefs_convert_result(lfs_getattr(&fs->lfs, path, 0, &attr,
+-                                            sizeof(attr)));
++  /* Keep the filesystem lock around handle-based metadata access and update. */
++
++  ret = nxmutex_lock(&fs->lock);
++  if (ret < 0)
++    {
++      return ret;
++    }
++
++  ret = littlefs_convert_result(lfs_file_getattr(&fs->lfs, &priv->file, 0,
++                                                 &attr, sizeof(attr)));
+   if (ret < 0)
+     {
+       if (ret != -ENODATA)
+@@ -906,15 +871,14 @@
+                      buf->st_mtim.tv_nsec;
+     }
+ 
+-  ret = littlefs_convert_result(lfs_setattr(&fs->lfs, path, 0, &attr,
+-                                            sizeof(attr)));
++  ret = littlefs_convert_result(lfs_file_setattr(&fs->lfs, &priv->file, 0,
++                                                 &attr, sizeof(attr)));
+   if (ret < 0)
+     {
+       goto errout;
+     }
+ 
+ errout:
+-  lib_put_tempbuffer(path);
+   nxmutex_unlock(&fs->lock);
+   return ret;
+ }

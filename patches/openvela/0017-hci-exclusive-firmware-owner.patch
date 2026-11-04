@@ -1,0 +1,98 @@
+diff --git a/drivers/serial/uart_bth4.c b/drivers/serial/uart_bth4.c
+--- a/drivers/serial/uart_bth4.c
++++ b/drivers/serial/uart_bth4.c
+@@ -65,6 +65,8 @@
+   mutex_t                 sendlock;
+   mutex_t                 openlock;
+   uint8_t                 refcnt;
++  bool                    exclusive;
++  bool                    handoff;
+   spinlock_t              lock;
+ 
+   FAR struct pollfd      *fds[CONFIG_UART_BTH4_NPOLLWAITERS];
+@@ -188,6 +190,16 @@
+       return ret;
+     }
+ 
++  /* Firmware loading and the host stack must not consume the same HCI
++   * response stream concurrently.  O_EXCL reserves it until final close. */
++
++  if (dev->refcnt != 0 &&
++      (dev->exclusive || (filep->f_oflags & O_EXCL) != 0))
++    {
++      nxmutex_unlock(&dev->openlock);
++      return -EBUSY;
++    }
++
+   tmp = dev->refcnt + 1;
+   if (tmp == 0)
+     {
+@@ -197,14 +209,16 @@
+ 
+   if (tmp == 1)
+     {
+-      ret = dev->drv->open(dev->drv);
++      ret = dev->handoff ? OK : dev->drv->open(dev->drv);
+       if (ret < 0)
+         {
+           nxmutex_unlock(&dev->openlock);
+           return ret;
+         }
+ 
++      dev->handoff = false;
+       dev->sendlen = 0;
++      dev->exclusive = (filep->f_oflags & O_EXCL) != 0;
+     }
+ 
+   dev->refcnt = tmp;
+@@ -227,7 +241,8 @@
+     }
+ 
+   dev->refcnt = 0;
+-  dev->drv->close(dev->drv);
++  dev->exclusive = false;
++  if (!dev->handoff) dev->drv->close(dev->drv);
+   uart_bth4_pollnotify(dev, POLLIN | POLLOUT);
+   nxmutex_unlock(&dev->openlock);
+ 
+@@ -250,6 +265,7 @@
+       nread = circbuf_read(&dev->circbuf, buffer, buflen);
+       if (nread != 0 || (filep->f_oflags & O_NONBLOCK))
+         {
++          if (nread == 0) nread = -EAGAIN;
+           break;
+         }
+ 
+@@ -492,3 +508,17 @@
+ 
+   return ret;
+ }
++
++/* Called only after all firmware command responses have been consumed. */
++int uart_bth4_handoff(FAR struct file *filep)
++{
++  if (filep == NULL || filep->f_inode == NULL ||
++      filep->f_inode->u.i_ops != &g_uart_bth4_ops) return -EINVAL;
++  FAR struct uart_bth4_s *dev = filep->f_inode->i_private;
++  int ret = nxmutex_lock(&dev->openlock);
++  if (ret < 0) return ret;
++  if (!dev->exclusive || dev->refcnt != 1) ret = -EPERM;
++  else dev->handoff = true;
++  nxmutex_unlock(&dev->openlock);
++  return ret;
++}
+diff --git a/include/nuttx/serial/uart_bth4.h b/include/nuttx/serial/uart_bth4.h
+--- a/include/nuttx/serial/uart_bth4.h
++++ b/include/nuttx/serial/uart_bth4.h
+@@ -58,6 +58,11 @@
+ 
+ int uart_bth4_register(FAR const char *path, FAR struct bt_driver_s *drv);
+ 
++/* Transfer an exclusively opened, initialized transport to its next owner
++ * without tearing down/restarting the H5 controller link. */
++struct file;
++int uart_bth4_handoff(FAR struct file *filep);
++
+ #undef EXTERN
+ #if defined(__cplusplus)
+ }

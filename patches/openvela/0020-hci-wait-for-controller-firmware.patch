@@ -1,0 +1,18 @@
+diff --git a/service/stacks/zephyr/hci_h4.c b/service/stacks/zephyr/hci_h4.c
+--- a/service/stacks/zephyr/hci_h4.c
++++ b/service/stacks/zephyr/hci_h4.c
+@@ -335,7 +335,13 @@
+     int fd;
+     struct h4_data* h4;
+ 
+-    fd = open(CONFIG_BT_UART_ON_DEV_NAME, O_RDWR | O_BINARY | O_CLOEXEC);
++    /* The board firmware loader owns O_EXCL until controller setup is done.
++     * Wait for that handoff before starting the host's enable state machine. */
++    for (unsigned int retry = 0; ; retry++) {
++        fd = open(CONFIG_BT_UART_ON_DEV_NAME, O_RDWR | O_BINARY | O_CLOEXEC);
++        if (fd >= 0 || errno != EBUSY || retry >= 1500) break;
++        usleep(20000);
++    }
+     if (fd < 0) {
+         BT_LOGE("H4: Failed to open %s: %d", CONFIG_BT_UART_ON_DEV_NAME, errno);
+         return fd;

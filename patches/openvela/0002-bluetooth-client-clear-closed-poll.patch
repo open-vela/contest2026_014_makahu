@@ -1,0 +1,41 @@
+diff --git a/service/ipc/socket/src/bt_socket_client.c b/service/ipc/socket/src/bt_socket_client.c
+index 29204131..e209df1e 100644
+--- a/service/ipc/socket/src/bt_socket_client.c
++++ b/service/ipc/socket/src/bt_socket_client.c
+@@ -234,6 +234,7 @@ static int bt_socket_client_receive(uv_poll_t* poll, int fd, void* userdata)
+ 
+     ret = recv(fd, (char*)packet + ins->offset, sizeof(*packet) - ins->offset, 0);
+     if (ret == 0) {
++        ins->poll = NULL;
+         thread_loop_remove_poll(poll);
+         return ret;
+     } else if (ret < 0) {
+@@ -292,11 +293,15 @@ static void bt_socket_client_handle_event(uv_poll_t* poll, int status, int event
+ 
+     ret = uv_fileno((uv_handle_t*)poll, &fd);
+     if (ret) {
++        if (ins)
++            ins->poll = NULL;
+         thread_loop_remove_poll(poll);
+         return;
+     }
+ 
+     if (status != 0 || events & UV_DISCONNECT) {
++        if (ins)
++            ins->poll = NULL;
+         thread_loop_remove_poll(poll);
+         if (ins && ins->disconnected) {
+             BT_LOGE("%s socket disconnect, status = %d, events = %d", __func__, status, events);
+@@ -304,8 +309,11 @@ static void bt_socket_client_handle_event(uv_poll_t* poll, int status, int event
+         }
+     } else if (events & UV_READABLE) {
+         ret = bt_socket_client_receive(poll, fd, poll->data);
+-        if (ret != BT_STATUS_SUCCESS)
++        if (ret != BT_STATUS_SUCCESS) {
++            if (ins)
++                ins->poll = NULL;
+             thread_loop_remove_poll(poll);
++        }
+     }
+ }
+ 

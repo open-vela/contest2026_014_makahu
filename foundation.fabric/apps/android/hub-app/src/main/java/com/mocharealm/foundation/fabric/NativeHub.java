@@ -14,6 +14,7 @@ public final class NativeHub {
     public static native String nativeCandidates();
     public static native boolean nativePair(String address);
     public static native boolean nativePairRemote(String deviceId);
+    public static native boolean nativeReloadTrust();
     public static native boolean nativeAccept(String deviceId);
     public static native boolean nativeRemove(String deviceId);
     public static native boolean nativeRegisterAbility(String ability, String packageName, int uid);
@@ -25,10 +26,15 @@ public final class NativeHub {
     public static native byte[] nativeTakeRemoteRequest();
     public static native byte[] nativeTakeRemoteStream();
     public static native void nativeCompleteRemote(long requestId, byte[] payload);
+    /** Authenticated transport origin for a live incoming invocation only. */
+    public static native byte[] nativeRemoteRequestPeer(long requestId);
 
     /** Session + hub clock (fabric-clock PeerClock mapping). */
     public static native String nativeOpenSession(String[] deviceIds, String ability, byte[] configJson);
     public static native void nativeCloseSession(String sessionId);
+    public static native boolean nativeApplicationSessionActive(String sessionId);
+    public static native String nativeRemoteRequestSession(long requestId);
+    public static native byte[] nativeInvokeSession(String sessionId, String deviceId, String ability, byte[] payload);
     public static native boolean nativeEnsureSessionClock(String sessionId);
     public static native long nativeSessionLocalNowNs();
     public static native long nativeSessionGroupToLocalNs(String deviceId, long groupNs);

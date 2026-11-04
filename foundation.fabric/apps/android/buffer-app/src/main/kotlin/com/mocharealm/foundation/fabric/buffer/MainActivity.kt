@@ -1,5 +1,6 @@
 package com.mocharealm.foundation.fabric.buffer
 import com.mocharealm.foundation.fabric.buffer.domain.model.BufferCapture
+import com.mocharealm.foundation.fabric.buffer.domain.BufferSourceHistoryCursor
 import com.mocharealm.foundation.fabric.buffer.domain.model.BufferCard
 import com.mocharealm.foundation.fabric.buffer.domain.model.BufferConstants
 import com.mocharealm.foundation.fabric.buffer.data.llm.BufferLlmClient
@@ -30,6 +31,7 @@ import com.mocharealm.foundation.fabric.buffer.ui.actionLabel
 import com.mocharealm.foundation.fabric.buffer.ui.cardStateLabel
 import com.mocharealm.foundation.fabric.buffer.ui.healthCategoryLabel
 import com.mocharealm.foundation.fabric.buffer.ui.modeLabel
+import com.mocharealm.foundation.fabric.buffer.domain.FocusSession
 import android.widget.EditText
 import android.widget.Button as AndroidButton
 import android.Manifest
@@ -79,6 +81,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.mocharealm.foundation.fabric.sdk.FabricClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
@@ -108,6 +117,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var velaDiscovery: VelaDiscovery
     private lateinit var healthExporter: HealthConnectExporter
     private val pairingExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val answerExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val sourceHistoryExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val calendarExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val homeRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var homeRefreshJob: Job? = null
+    private var homeRefreshPending = false
+    private var homeSnapshotLoaded = false
+    private var calendarRequest = 0L
+    private var calendarDialog: AlertDialog? = null
+    private var sourceHistoryRequest = 0L
+    private var sourceHistoryLoading: AlertDialog? = null
 
     private var reminderCardId by mutableStateOf<String?>(null)
     private var reminderCard by mutableStateOf<BufferCard?>(null)
@@ -120,10 +140,13 @@ class MainActivity : ComponentActivity() {
     private var textInput by mutableStateOf("")
     private var quickCaptureTarget by mutableStateOf<QuickCaptureTarget?>(null)
     private var status by mutableStateOf("正在启动 Buffer")
-    private var bedtimeSchedule by mutableStateOf("")
+    private var meshQuestionStatusCard: String? = null
     private var bridgeRunning by mutableStateOf(false)
     private var fabricConnected by mutableStateOf(false)
     private var mode by mutableStateOf("normal")
+    private var focusSession by mutableStateOf<FocusSession?>(null)
+    private var pendingFocusCalendar = false
+    private var pendingSharedCalendar = false
     private var researchSession by mutableStateOf<RabbitHoleSession?>(null)
     private var pendingCaptures by mutableStateOf(0)
     private var eventCount by mutableStateOf(0)
@@ -144,9 +167,17 @@ class MainActivity : ComponentActivity() {
     private val fabricAbilityHandler = object : FabricClient.AbilityHandler {
         override fun onInvoke(requestId: Long, payload: ByteArray) {
             val response = try {
-                BufferWire.handle(repository, JSONObject(payload.decodeToString()))
+                val peer = (fabricClient.invocationPeer(requestId) ?: throw SecurityException("invocation origin unavailable or expired"))
+                    .joinToString("") { "%02x".format(it) }
+                val local = fabricClient.localDeviceId.joinToString("") { "%02x".format(it) }
+                val raw = payload.toString(Charsets.UTF_8)
+                require(raw.toByteArray(Charsets.UTF_8).contentEquals(payload)) { "invalid UTF-8" }
+                val request = com.mocharealm.foundation.fabric.buffer.domain.BufferSourceEvent.parseObject(raw, 512 * 1024)
+                val session = if (peer != local && request.optString("type") in setOf("buffer.mesh.job", "buffer.mesh.input", "buffer.mesh.facts"))
+                    fabricClient.invocationSession(requestId) else null
+                BufferWire.handleAuthenticated(repository, request, peer, local, session)
             } catch (error: Exception) {
-                JSONObject().put("type", "error").put("code", "invalid_payload")
+                JSONObject().put("type", "error").put("code", if (error is SecurityException) "authentication_required" else "invalid_payload")
                     .put("detail", error.message ?: "invalid payload")
             }
             try {
@@ -177,12 +208,9 @@ class MainActivity : ComponentActivity() {
         repository = application.repository
         bridge = application.bridge
         fabricClient = FabricClient(this)
+        application.fabricClient = fabricClient
         velaDiscovery = VelaDiscovery()
         healthExporter = HealthConnectExporter(this)
-        repository.reconcileRabbitSession(System.currentTimeMillis())
-        researchSession = repository.rabbitSession()
-        mode = repository.mode()
-        bedtimeSchedule = repository.bedtimeSchedule()
         refresh()
         textInput = savedInstanceState?.getString(STATE_CAPTURE_DRAFT).orEmpty()
         if (savedInstanceState == null) {
@@ -191,9 +219,13 @@ class MainActivity : ComponentActivity() {
         } else {
             quickCaptureTarget = QuickCaptureTarget.fromAction(savedInstanceState.getString(STATE_CAPTURE_TARGET))
             reminderCardId = savedInstanceState.getString("reminder_card_id")
-            reminderCard = reminderCardId?.let(repository::findCard)
+            refresh()
         }
 
+        // Restore saved device connections even if the Activity is created
+        // behind the keyguard and Compose has not produced its first frame.
+        startBridgeIfAllowed()
+        connectFabric()
         setContent {
             BufferTheme {
                 if (reminderCardId != null) {
@@ -203,7 +235,7 @@ class MainActivity : ComponentActivity() {
                         title = { Text(card?.title ?: "提醒事项") },
                         text = {
                             Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
-                                Text(card?.summary ?: "这张卡片已不存在。")
+                                Text(card?.summary ?: if(homeSnapshotLoaded) "这张卡片已不存在。" else "正在读取提醒事项…")
                                 card?.let { Text("当前状态：${cardStateLabel(it.state)}") }
                             }
                         },
@@ -240,6 +272,15 @@ class MainActivity : ComponentActivity() {
                 val calendarLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions(),
                 ) { grants ->
+                    if (pendingSharedCalendar) {
+                        pendingSharedCalendar = false
+                        showSharedCalendar()
+                    }
+                    if (pendingFocusCalendar) {
+                        pendingFocusCalendar = false
+                        if (grants[Manifest.permission.READ_CALENDAR] == true) showFocusCalendar()
+                        else status = "未授予日历权限"
+                    }
                     val card = pendingCalendarCard
                     val action = pendingCalendarAction
                     pendingCalendarCard = null
@@ -341,7 +382,6 @@ class MainActivity : ComponentActivity() {
                     pendingAudio = pendingAudio,
                     textInput = textInput,
                     status = status,
-                    bedtimeSchedule = bedtimeSchedule,
                     bridgeRunning = bridgeRunning,
                     fabricConnected = fabricConnected,
                     mode = mode,
@@ -371,8 +411,6 @@ class MainActivity : ComponentActivity() {
                         } catch (error: Exception) { status = error.message ?: "删除失败"; false }
                     },
                     onGenerateWeeklySummary = ::generateWeeklySummary,
-                    onBedtimeScheduleChanged = { bedtimeSchedule = it },
-                    onSaveBedtimeSchedule = ::saveBedtimeSchedule,
                     onManualTranscription = ::completeManualTranscription,
                     onStartRecording = {
                         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -396,6 +434,8 @@ class MainActivity : ComponentActivity() {
                                 .setPositiveButton("拒绝分类") { _, _ ->
                                     reviewClassification(card, ClassificationDecision.REJECT)
                                 }.show()
+                        } else if (action == "task_schedule") {
+                            showTaskSchedule(card)
                         } else if (action == "calendar" || action == "remove_calendar") {
                             requestCalendarAction(card, action, calendarLauncher)
                         } else if (action == "health_sync") {
@@ -415,6 +455,18 @@ class MainActivity : ComponentActivity() {
                     onModeChanged = ::changeMode,
                     onLoadFocusSettings = repository::focusReminderConfig,
                     onSaveFocusSettings = ::saveFocusReminderSettings,
+                    focusSession = focusSession,
+                    onFocus = { showFocusSession { requestCalendarAction(it, "calendar", calendarLauncher) } },
+                    onFocusHistory = { showFocusHistory { requestCalendarAction(it, "calendar", calendarLauncher) } },
+                    onSourceHistory = { showSourceJournal() },
+                    onCalendar = {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED) showSharedCalendar()
+                        else { pendingSharedCalendar = true; calendarLauncher.launch(arrayOf(Manifest.permission.READ_CALENDAR)) }
+                    },
+                    onFocusCalendar = {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED) showFocusCalendar()
+                        else { pendingFocusCalendar = true; calendarLauncher.launch(arrayOf(Manifest.permission.READ_CALENDAR)) }
+                    },
                     researchSession = researchSession,
                     onResearch = ::showResearchSession,
                     onResearchRecord = ::showResearchRecord,
@@ -448,7 +500,9 @@ class MainActivity : ComponentActivity() {
     private fun acceptReminderIntent(incoming: Intent) {
         val id = CardReminderNavigation.cardId(incoming) ?: return
         reminderCardId = id
-        reminderCard = repository.findCard(id)
+        reminderCard = null
+        homeSnapshotLoaded = false
+        refresh()
         incoming.action = Intent.ACTION_MAIN
         incoming.data = null
     }
@@ -467,11 +521,14 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        sourceHistoryRequest++
+        sourceHistoryLoading?.dismiss();sourceHistoryLoading=null
         stopRecording()
         super.onStop()
     }
 
     override fun onDestroy() {
+        homeRefreshScope.cancel()
         activeRecording?.let { stopRecording() }
         if (fabricAbilityRegistered) {
             try {
@@ -480,8 +537,16 @@ class MainActivity : ComponentActivity() {
                 // The Hub may have stopped before the app.
             }
         }
+        if ((application as BufferApplication).fabricClient === fabricClient) (application as BufferApplication).fabricClient = null
         fabricClient.close()
         pairingExecutor.shutdownNow()
+        answerExecutor.shutdownNow()
+        sourceHistoryRequest++
+        sourceHistoryLoading?.dismiss();sourceHistoryLoading=null
+        sourceHistoryExecutor.shutdownNow()
+        calendarRequest++
+        calendarDialog?.dismiss();calendarDialog=null
+        calendarExecutor.shutdownNow()
         super.onDestroy()
     }
 
@@ -538,6 +603,9 @@ class MainActivity : ComponentActivity() {
                             try {
                                 fabricClient.registerAbility(BufferConstants.ability, fabricAbilityHandler)
                                 fabricAbilityRegistered = true
+                                homeRefreshScope.launch(Dispatchers.IO) {
+                                    (application as BufferApplication).velaFabric.resume()
+                                }
                             } catch (error: Exception) {
                                 status = "Buffer ability 注册失败：${error.message}"
                             }
@@ -608,21 +676,66 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private data class HomeSnapshot(
+        val research: RabbitHoleSession?, val focus: FocusSession?, val reminder: BufferCard?,
+        val mode: String, val cards: List<BufferCard>, val shelf: List<BufferCard>,
+        val answers: List<BufferCard>, val lifeLog: List<BufferCard>, val weekly: BufferWeeklySummary,
+        val audio: List<BufferCapture>, val pending: Int, val events: Int,
+        val paired: List<String>, val questionNotice: String?,
+    )
+
     private fun refresh() {
-        repository.reconcileRabbitSession(System.currentTimeMillis())
-        researchSession = repository.rabbitSession()
-        reminderCard = reminderCardId?.let(repository::findCard)
-        mode = repository.mode()
-        cards = if (mode == "bedtime") repository.cardsForMode(mode) else repository.cards()
-        shelfCards = repository.shelfCards()
-        answerBoxCards = repository.answerBoxCards()
-        lifeLogCards = repository.lifeLogCards()
-        weeklySummary = repository.weeklySummary()
-        pendingAudio = repository.pendingAudioCaptures()
-        pendingCaptures = repository.pendingCaptureCount()
-        eventCount = repository.eventCount()
-        bridgeRunning = bridge.isRunning
-        pairedVelaIds = repository.pairedVelaIds()
+        if(android.os.Looper.myLooper()!=android.os.Looper.getMainLooper()){
+            runOnUiThread(::refresh);return
+        }
+        if(isFinishing||isDestroyed)return
+        homeRefreshPending=true
+        if(homeRefreshJob?.isActive==true)return
+        homeRefreshJob=homeRefreshScope.launch {
+            try {
+                do {
+                    homeRefreshPending=false
+                    val reminderId=reminderCardId
+                    val questionId=meshQuestionStatusCard
+                    val waiting=setOf("已提交协作问答，结果将自动显示","协作问答状态暂不可读")
+                    val readQuestion=questionId!=null&&status in waiting
+                    val result=withContext(Dispatchers.IO) {
+                        runCatching {
+                            repository.reconcileRabbitSession(System.currentTimeMillis())
+                            val currentMode=repository.mode()
+                            HomeSnapshot(repository.rabbitSession(),repository.focusSession(),
+                                reminderId?.let(repository::findCard),currentMode,
+                                repository.cardsForMode(currentMode),repository.shelfCards(),
+                                repository.answerBoxCards(),repository.lifeLogCards(),repository.weeklySummary(),
+                                repository.pendingAudioCaptures(),repository.pendingCaptureCount(),repository.eventCount(),
+                                repository.pairedVelaIds(),if(readQuestion)runCatching {
+                                    repository.meshQuestionNotice(requireNotNull(questionId))
+                                }.getOrElse {"协作问答状态暂不可读"} else null)
+                        }
+                    }
+                    // Publish a finished snapshot even if the periodic refresh
+                    // arrived during I/O. Dropping every slow result would leave
+                    // the screen loading forever; pending requests coalesce into
+                    // one follow-up read. Reminder identity is checked separately.
+                    result.onSuccess { view ->
+                        researchSession=view.research;focusSession=view.focus
+                        if(reminderId==reminderCardId)reminderCard=view.reminder
+                        mode=view.mode;cards=view.cards;shelfCards=view.shelf
+                        answerBoxCards=view.answers;lifeLogCards=view.lifeLog;weeklySummary=view.weekly
+                        pendingAudio=view.audio;pendingCaptures=view.pending;eventCount=view.events
+                        pairedVelaIds=view.paired;bridgeRunning=bridge.isRunning;homeSnapshotLoaded=true
+                        if(questionId==meshQuestionStatusCard){
+                            if(readQuestion&&status in waiting){
+                                view.questionNotice?.let {status=it}
+                                if(view.questionNotice !in waiting)meshQuestionStatusCard=null
+                            }else if(!readQuestion)meshQuestionStatusCard=null
+                        }
+                    }.onFailure {
+                        android.util.Log.w("BufferHome","Home snapshot load failed",it)
+                    }
+                } while(homeRefreshPending)
+            } finally {homeRefreshJob=null}
+        }
     }
 
     private fun saveText() {
@@ -652,20 +765,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun saveBedtimeSchedule() {
-        try {
-            repository.setBedtimeSchedule(bedtimeSchedule)
-            bedtimeSchedule = repository.bedtimeSchedule()
-            status = if (bedtimeSchedule.isBlank()) {
-                "已关闭自动睡前模式"
-            } else {
-                "已设置每天 $bedtimeSchedule 自动进入睡前模式"
-            }
-        } catch (error: Exception) {
-            status = "睡前时间无效：${error.message}"
-        }
-    }
-
     private fun completeManualTranscription(capture: BufferCapture, transcript: String) {
         val cleanTranscript = transcript.trim()
         if (cleanTranscript.isEmpty()) return
@@ -690,7 +789,12 @@ class MainActivity : ComponentActivity() {
         if (activeRecording != null) return false
         val file = File(cacheDir, "buffer-${UUID.randomUUID()}.m4a")
         var recorder: MediaRecorder? = null
+        var ownsFile = false
         return try {
+            val fd = android.system.Os.open(file.absolutePath, android.system.OsConstants.O_RDWR or
+                android.system.OsConstants.O_CREAT or android.system.OsConstants.O_EXCL or android.system.OsConstants.O_NOFOLLOW, 384)
+            ownsFile = true
+            android.system.Os.close(fd)
             val started = MediaRecorder().also { recorder = it }.apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
                 setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
@@ -716,7 +820,7 @@ class MainActivity : ComponentActivity() {
             true
         } catch (error: Exception) {
             recorder?.let { runCatching { it.release() } }
-            file.delete()
+            if (ownsFile) file.delete()
             status = "录音启动失败：${error.message}"
             false
         }
@@ -748,6 +852,8 @@ class MainActivity : ComponentActivity() {
                     captureId = captureId, sourceDevice = "android", createdAt = createdAt,
                     mode = captureMode, audioFormat = "audio/mp4;codec=aac;rate=16000;channels=1",
                     durationMs = duration, audio = active.file.readBytes(),
+                    collectLocalContext = true,
+                    localOriginal = true,
                 )
             },
             preserve = {
@@ -755,6 +861,8 @@ class MainActivity : ComponentActivity() {
                     captureId = captureId, sourceDevice = "android", createdAt = createdAt,
                     mode = captureMode, audioFormat = "audio/mp4;codec=aac;rate=16000;channels=1",
                     durationMs = duration, sourceFile = active.file,
+                    collectLocalContext = true,
+                    localOriginal = true,
                 )
             },
             cleanup = { active.file.delete() || !active.file.exists() },
@@ -782,7 +890,7 @@ class MainActivity : ComponentActivity() {
 
     private fun saveCardReturn(card: BufferCard, at: Long, action: String) {
         try {
-            requireNotNull(repository.performCardAction(card.cardId, action, requestedReturnAt = at)) { "卡片已不存在" }
+            requireNotNull(repository.performCardAction(card.cardId, action, requestedReturnAt = at, expectedCard = card)) { "卡片已不存在" }
             val whenText = java.time.Instant.ofEpochMilli(at).atZone(ZoneId.systemDefault())
                 .format(java.time.format.DateTimeFormatter.ofPattern("MM-dd HH:mm z"))
             status = "已安排 $whenText ${if (action == "remind") "提醒" else "再看"}"
@@ -954,7 +1062,7 @@ class MainActivity : ComponentActivity() {
         val tags = rawTags.split(',', '，', '\n')
         pairingExecutor.execute {
             try {
-                repository.updateCardTags(card.cardId, tags)
+                repository.updateCardTags(card.cardId, tags, expectedCard = card)
                 runOnUiThread {
                     status = "标签已保存"
                     refresh()
@@ -1008,41 +1116,65 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestQuickAnswer(card: BufferCard) {
-        val config = runCatching { repository.llmConfig() }.getOrElse {
-            status = "无法读取 LLM 配置，请在设置中重新保存密钥"; return
-        }
-        if (!config.ready) {
-            status = "请先在设置中配置 LLM 服务"
-            return
-        }
-        status = "正在请求问题短答案"
-        repository.recordQuestionAnswerRequested(card)
+        status = "正在提交问题问答"
         pairingExecutor.execute {
+            var request: String? = null
             try {
-                when (val result = BufferLlmClient.answer(config, card)) {
-                    is QuickAnswerResult.Answer -> {
-                        requireNotNull(repository.saveQuestionAnswer(card.cardId, result.text, source = "remote", expected = card)) { "问题已不存在" }
-                        runOnUiThread {
-                            status = "问题已获得短答案"
-                            refresh()
-                        }
+                if (repository.queueMeshQuestionAnswer(card)) {
+                    runOnUiThread {
+                        runCatching { repository.meshQuestionNotice(card.cardId) }.getOrElse { "协作问答状态暂不可读" }
+                            ?.let { meshQuestionStatusCard = card.cardId; status = it }
+                        refresh()
                     }
-                    is QuickAnswerResult.Unresolved -> {
-                        repository.recordQuestionAnswerDeferred(card, result.detail)
-                        runOnUiThread {
-                            status = "暂时未解：${result.detail}"
-                            refresh()
+                    return@execute
+                }
+                val config = repository.llmConfig()
+                if (!config.ready) {
+                    runOnUiThread { status = "请先在设置中配置 LLM 服务" }
+                    return@execute
+                }
+                val currentRequest = repository.recordQuestionAnswerRequested(card)
+                request = currentRequest
+                answerExecutor.execute answer@ {
+                    try {
+                        if (!repository.questionAnswerRequestCurrent(card.cardId, currentRequest) || repository.findCard(card.cardId) != card) return@answer
+                        val currentConfig = repository.llmConfig()
+                        check(currentConfig.baseUrl == config.baseUrl && currentConfig.model == config.model && currentConfig.apiKey == config.apiKey) { "AI 服务配置已变化，请重新请求" }
+                        check(!Thread.currentThread().isInterrupted)
+                        runOnUiThread { if (repository.questionAnswerRequestCurrent(card.cardId, currentRequest)) status = "正在请求问题短答案" }
+                        val result = BufferLlmClient.answer(config, card)
+                        val completedConfig = repository.llmConfig()
+                        check(completedConfig.baseUrl == config.baseUrl && completedConfig.model == config.model && completedConfig.apiKey == config.apiKey) { "AI 服务配置已变化，请重新请求" }
+                        when (result) {
+                            is QuickAnswerResult.Answer -> {
+                                requireNotNull(repository.saveQuestionAnswer(card.cardId, result.text, source = "remote", expected = card, request = currentRequest)) { "问题已不存在" }
+                                runOnUiThread {
+                                    if (repository.questionAnswerRequestCurrent(card.cardId, currentRequest)) status = "问题已获得短答案"
+                                    refresh()
+                                }
+                            }
+                            is QuickAnswerResult.Unresolved -> {
+                                repository.recordQuestionAnswerDeferred(card, result.detail, request = currentRequest)
+                                runOnUiThread {
+                                    if (repository.questionAnswerRequestCurrent(card.cardId, currentRequest) && repository.findCard(card.cardId) == card) status = "暂时未解：${result.detail}"
+                                    refresh()
+                                }
+                            }
                         }
-                    }
+                    } catch (error: Exception) { quickAnswerFailed(card, currentRequest, error) }
                 }
-            } catch (error: Exception) {
-                val receiptFailure = runCatching {
-                    repository.recordQuestionAnswerFailed(card, error.message ?: "回答服务不可用")
-                }.exceptionOrNull()
-                runOnUiThread {
-                    status = "快速回答失败：${error.message ?: "回答服务不可用"}"
-                    if (receiptFailure != null) status += "；失败记录也未保存"
-                }
+            } catch (error: Exception) { quickAnswerFailed(card, request, error) }
+        }
+    }
+
+    private fun quickAnswerFailed(card: BufferCard, request: String?, error: Exception) {
+        val receiptFailure = runCatching {
+            request?.let { repository.recordQuestionAnswerFailed(card, error.message ?: "回答服务不可用", request = it) }
+        }.exceptionOrNull()
+        runOnUiThread {
+            if (request == null || runCatching { repository.questionAnswerRequestCurrent(card.cardId, request) }.getOrDefault(true)) {
+                status = "快速回答失败：${error.message ?: "回答服务不可用"}"
+                if (receiptFailure != null) status += "；失败记录也未保存"
             }
         }
     }
@@ -1097,8 +1229,11 @@ class MainActivity : ComponentActivity() {
                     }
                 },
                 export = {
-                    check(repository.isClassificationConfirmed(card.cardId)) { "请先确认分类，再写入健康数据" }
-                    runBlocking { healthExporter.export(card) }
+                    val current=requireNotNull(repository.findCard(card.cardId)) { "记录已不存在" }
+                    check(current.classificationConfirmed && current.kind=="care_card" && current.state!="deleted" && current.healthCategory==card.healthCategory) { "记录已更新，请重新确认分类和写入权限" }
+                    val measurements=repository.healthQuantForExport(card.cardId)
+                    if(current.healthCategory=="nutrition")check(measurements!=null){"请先核对并确认饮食营养数值"}
+                    runBlocking { healthExporter.exportQuantified(current,measurements) }
                 },
                 commit = { result ->
                     requireNotNull(repository.markHealthSynced(
@@ -1320,9 +1455,14 @@ class MainActivity : ComponentActivity() {
                     commit = { id ->
                         eventId = id
                         repository.commitCalendarChange(card.cardId, card.captureId, id, deleted = false)
+                        if (card.kind == "task_card") repository.setTaskSchedule(card.cardId,
+                            com.mocharealm.foundation.fabric.buffer.domain.TaskSchedule(selection.startMillis, selection.endMillis, false, selection.timeZone))
                     },
                 )
+                val focusPlan = runCatching { BufferFocusCalendar(this, repository).upcoming()
+                    .firstOrNull { it.eventId.toString() == eventId && it.begin == selection.startMillis } }.getOrNull()
                 runOnUiThread {
+                    if (focusPlan != null) showFocusCalendarPolicy(focusPlan)
                     status = "已加入日历：${card.title}"
                     refresh()
                 }
@@ -1387,7 +1527,10 @@ class MainActivity : ComponentActivity() {
     private fun showResearchHistory(offset: Int = 0) {
         try {
             val page = repository.rabbitHistory(21, offset)
-            if (page.isEmpty()) { status = "还没有研究记录"; return }
+            if (page.isEmpty()) {
+                if (offset == 0) showSourceSessionHistory() else status = "没有更早的研究记录"
+                return
+            }
             val sessions = page.take(20)
             val formatter = java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
             val labels = sessions.map { "${formatter.format(java.util.Date(it.startedAt))} · ${it.title}" }
@@ -1410,6 +1553,7 @@ class MainActivity : ComponentActivity() {
                 }.setNegativeButton("关闭", null)
             if (page.size > 20) dialog.setPositiveButton("更早记录") { _, _ -> showResearchHistory(offset + 20) }
             if (offset > 0) dialog.setNeutralButton("返回最新") { _, _ -> showResearchHistory() }
+            else dialog.setNeutralButton("设备状态历史") { _, _ -> showSourceSessionHistory() }
             dialog.show()
         } catch (error: Exception) { status = "研究历史读取失败：${error.message}" }
     }
@@ -1465,7 +1609,298 @@ class MainActivity : ComponentActivity() {
         false
     }
 
+    private fun showFocusSession(onSchedule: (BufferCard) -> Unit) {
+        val session = repository.focusSession()
+        if (session?.active == true) {
+            AlertDialog.Builder(this).setTitle(session.title).setMessage("正在专注。结束后可以记录进展和感受。")
+                .setNegativeButton("继续专注", null).setPositiveButton("结束专注") { _, _ ->
+                    runCatching { repository.finishFocus(session.id) }.onSuccess {
+                        refresh(); showFocusReview(it, onSchedule)
+                    }.onFailure { status = it.message.orEmpty() }
+                }.show()
+        } else if (session?.status == "review_pending") showFocusReview(session, onSchedule)
+        else showFocusStart()
+    }
+
+    private fun showFocusStart() {
+        val tasks = repository.focusTaskCandidates()
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 8, 32, 8) }
+        val title = EditText(this).apply { hint = "这段时间想做什么？"; maxLines = 3 }
+        val picker = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+            listOf("不关联待办") + tasks.map { it.title }) }
+        picker.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                if (position > 0) title.setText(tasks[position - 1].title)
+            }
+        }
+        layout.addView(title); layout.addView(picker)
+        val dialog = AlertDialog.Builder(this).setTitle("开始专注").setView(layout)
+            .setNegativeButton("取消", null).setPositiveButton("开始", null).create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            runCatching { repository.startFocus(title.text.toString(), tasks.getOrNull(picker.selectedItemPosition - 1)?.cardId.orEmpty()) }
+                .onSuccess { dialog.dismiss(); refresh(); (application as BufferApplication).careScheduler.onAlarm() }
+                .onFailure { title.error = it.message }
+        } }; dialog.show()
+    }
+
+    private fun showFocusReview(session: FocusSession, onSchedule: (BufferCard) -> Unit) {
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 8, 32, 8) }
+        fun choices(label: String, values: List<String>, selected: Int): Spinner {
+            content.addView(TextView(this).apply { text = label })
+            return Spinner(this).also { it.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, values)
+                it.setSelection(selected); content.addView(it) }
+        }
+        val progress = choices("事情推进得怎么样？", listOf("请选择", "做完了", "推进了一些", "还没开始"),
+            listOf("", "done", "partial", "not_started").indexOf(session.progress))
+        val experience = choices("现在感觉怎么样？（可跳过）", listOf("暂不记录", "还不错", "有些累", "很吃力"),
+            listOf("", "good", "tired", "hard").indexOf(session.experience))
+        val remaining = EditText(this).apply { hint = "剩下什么？（可选）"; setText(session.remaining) }
+        content.addView(remaining)
+        val error = TextView(this); content.addView(error)
+        val dialog = AlertDialog.Builder(this).setTitle(session.title).setView(ScrollView(this).apply { addView(content) })
+            .setNegativeButton("稍后回顾", null).setNeutralButton("开始新一段") { _, _ -> showFocusStart() }
+            .setPositiveButton("保存", null).create()
+        dialog.setOnShowListener { dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            runCatching { repository.reviewFocus(session.id, listOf("", "done", "partial", "not_started")[progress.selectedItemPosition],
+                listOf("", "good", "tired", "hard")[experience.selectedItemPosition], remaining.text.toString()) }
+                .onSuccess { reviewed ->
+                    dialog.dismiss(); refresh()
+                    if (reviewed.progress == "done" && reviewed.cardId.isNotEmpty()) {
+                        repository.findCard(reviewed.cardId)?.takeIf { it.state !in setOf("done", "deleted", "archived") }?.let { card ->
+                            AlertDialog.Builder(this).setTitle("完成关联待办？").setMessage(card.title)
+                                .setNegativeButton("保留待办", null).setPositiveButton("标记完成") { _, _ -> performAction(card, "done") }.show()
+                        }
+                    } else if (reviewed.remaining.isNotBlank()) {
+                        AlertDialog.Builder(this).setTitle("安排剩余事项？").setMessage(reviewed.remaining)
+                            .setNegativeButton("仅保留反馈", null)
+                            .setNeutralButton("放回待办") { _, _ ->
+                                runCatching { repository.remainingFocusTask(reviewed.id) }
+                                    .onSuccess { status = "已放回待办"; refresh() }.onFailure { status = it.message.orEmpty() }
+                            }.setPositiveButton("选择时间") { _, _ ->
+                                runCatching { repository.remainingFocusTask(reviewed.id) }
+                                    .onSuccess { refresh(); onSchedule(it) }.onFailure { status = it.message.orEmpty() }
+                            }.show()
+                    }
+                }.onFailure { error.text = it.message ?: "请选择进展后重试" }
+        } }; dialog.show()
+    }
+
+    private fun showFocusHistory(onSchedule: (BufferCard) -> Unit) {
+        val sessions = repository.focusHistory()
+        if (sessions.isEmpty()) { showSourceSessionHistory(); return }
+        AlertDialog.Builder(this).setTitle("专注记录")
+            .setItems(sessions.map { "${it.title} · ${if (it.active) "进行中" else if (it.status == "review_pending") "待回顾" else "已回顾"}" }.toTypedArray()) { _, position ->
+                if (!sessions[position].active) showFocusReview(sessions[position], onSchedule)
+            }.setNeutralButton("设备状态历史") { _, _ -> showSourceSessionHistory() }.setNegativeButton("返回", null).show()
+    }
+
+    private fun <T> readSourceJournal(read: () -> T, show: (T) -> Unit) {
+        if(isFinishing || isDestroyed)return
+        sourceHistoryLoading?.dismiss()
+        val request=++sourceHistoryRequest
+        val waiting=AlertDialog.Builder(this).setMessage("正在读取原始记录…")
+            .setNegativeButton("取消") { _, _ -> if(request==sourceHistoryRequest){sourceHistoryRequest++;sourceHistoryLoading=null} }.create()
+        waiting.setOnCancelListener { if(request==sourceHistoryRequest){sourceHistoryRequest++;sourceHistoryLoading=null} }
+        sourceHistoryLoading=waiting
+        waiting.show()
+        try { sourceHistoryExecutor.execute {
+            val value=try { read() } catch (_: Exception) {
+                runOnUiThread {
+                    if(sourceHistoryLoading===waiting){waiting.dismiss();sourceHistoryLoading=null}
+                    if(request==sourceHistoryRequest && !isFinishing && !isDestroyed)status="原始记录暂时无法核对，请稍后重试"
+                }
+                return@execute
+            }
+            runOnUiThread {
+                if(sourceHistoryLoading===waiting){waiting.dismiss();sourceHistoryLoading=null}
+                if(request==sourceHistoryRequest && !isFinishing && !isDestroyed)show(value)
+            }
+        } } catch (_: java.util.concurrent.RejectedExecutionException) { waiting.dismiss();sourceHistoryLoading=null }
+    }
+
+    private fun showSourceJournal(before: BufferSourceHistoryCursor? = null) {
+        readSourceJournal({repository.sourceJournal(before)}) { page ->
+            val events=page.entries.asReversed()
+            fun label(event: com.mocharealm.foundation.fabric.buffer.domain.BufferSourceHistoryEntry): String {
+                val time=if(event.createdAt>0)java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT,java.text.DateFormat.SHORT)
+                    .format(java.util.Date(event.createdAt)) else "时间待核对"
+                return "$time · ${if(event.local)"本机" else "其他设备"}\n${com.mocharealm.foundation.fabric.buffer.ui.sourceEventLabel(event.type)} · ${com.mocharealm.foundation.fabric.buffer.ui.sourceHistoryStateLabel(event.state)}"
+            }
+            val dialog=AlertDialog.Builder(this).setTitle(if(page.hasHeld)"原始事件簿 · 部分原文待交付" else "原始事件簿")
+                .setNegativeButton("关闭",null)
+            if(events.isEmpty())dialog.setMessage("暂无已保存的原始事件")
+            else dialog.setItems(events.map(::label).toTypedArray()) { _, index ->
+                val event=events[index]
+                val text=buildString {
+                    append(label(event));append("\n来源：${event.source}\n事件：${event.eventId}")
+                    event.audio?.let { append("\n${com.mocharealm.foundation.fabric.buffer.ui.sourceAudioStateLabel(it.stage,it.problem)}") }
+                    if(page.hasHeld)append("\n相关来源仍有未交付原文的保留位置。")
+                }
+                val detail=AlertDialog.Builder(this).setTitle("原始事件").setMessage(text)
+                    .setPositiveButton("阅读原文") { _, _ -> showSourceOriginal(event.eventId,0,before) }
+                    .setNeutralButton("返回事件簿") { _, _ -> showSourceJournal(before) }
+                    .setNegativeButton("关闭",null)
+                if(event.state in setOf("corrupt","invalid_clock","history_gap","parent_conflict"))
+                    detail.setNegativeButton("重新核对") { _, _ ->
+                        readSourceJournal({repository.requestSourceHistoryRebuild()}) {
+                            status="已安排重新核对来源历史";showSourceJournal(before)
+                        }
+                    }
+                detail.show()
+            }
+            page.older?.let { cursor -> dialog.setPositiveButton("更早记录") { _, _ -> showSourceJournal(cursor) } }
+            if(before!=null)dialog.setNeutralButton("返回最新") { _, _ -> showSourceJournal() }
+            dialog.show()
+        }
+    }
+
+    private fun showSourceOriginal(id: String,offset: Int,before: BufferSourceHistoryCursor?) {
+        readSourceJournal({repository.sourceOriginal(id,offset)}) { page ->
+            val content=TextView(this).apply {
+                text=page.text;setTextIsSelectable(true);setPadding(24,16,24,16)
+                typeface=android.graphics.Typeface.MONOSPACE
+            }
+            val dialog=AlertDialog.Builder(this).setTitle("原文 ${page.offset+1}–${page.offset+page.text.length} / ${page.total}")
+                .setView(ScrollView(this).apply { addView(content) })
+                .setNeutralButton("返回事件簿") { _, _ -> showSourceJournal(before) }
+            page.next?.let { next -> dialog.setPositiveButton("下一段") { _, _ -> showSourceOriginal(id,next,before) } }
+            page.previous?.let { previous -> dialog.setNegativeButton("上一段") { _, _ -> showSourceOriginal(id,previous,before) } }
+            dialog.show()
+        }
+    }
+
+    private fun showSourceSessionHistory(before: String? = null) {
+        try {
+            val page = repository.sourceObservations(before = before)
+            if(page.recovering){status="设备状态历史正在恢复，请稍后查看";return}
+            if (page.entries.isEmpty()) { status = "暂无已保存的设备状态历史"; return }
+            val dialog = AlertDialog.Builder(this).setTitle("设备状态历史 · 最近记录")
+                .setItems(page.entries.map { com.mocharealm.foundation.fabric.buffer.ui.sourceObservationTitle(it) }.toTypedArray()) { _, index ->
+                    val entry = page.entries[index]
+                    AlertDialog.Builder(this).setTitle(com.mocharealm.foundation.fabric.buffer.ui.sourceObservationTitle(entry))
+                        .setMessage(com.mocharealm.foundation.fabric.buffer.ui.sourceObservationDetail(entry))
+                        .setPositiveButton("关闭", null).show()
+                }.setNegativeButton("关闭", null)
+            page.older?.let { cursor -> dialog.setPositiveButton("更早记录") { _, _ -> showSourceSessionHistory(cursor) } }
+            if (before != null) dialog.setNeutralButton("返回最新") { _, _ -> showSourceSessionHistory() }
+            dialog.show()
+        } catch (_: Exception) { status = "设备状态历史暂时无法读取，请稍后重试" }
+    }
+
+    private fun showTaskSchedule(card: BufferCard) {
+        val zone = ZoneId.systemDefault()
+        val saved = repository.taskSchedule(card)
+        val initial = saved?.let { java.time.Instant.ofEpochMilli(it.start).atZone(zone).toLocalDate() } ?: LocalDate.now(zone)
+        DatePickerDialog(this, { _, y, m, d ->
+            val date = LocalDate.of(y, m + 1, d)
+            fun save(time: LocalTime?, minutes: Long = 60) {
+                val from = if (time == null) date.atStartOfDay(zone) else date.atTime(time).atZone(zone)
+                val to = if (time == null) date.plusDays(1).atStartOfDay(zone) else from.plusMinutes(minutes)
+                runCatching { repository.setTaskSchedule(card.cardId, com.mocharealm.foundation.fabric.buffer.domain.TaskSchedule(
+                    from.toInstant().toEpochMilli(), to.toInstant().toEpochMilli(), time == null, zone.id)) }
+                    .onSuccess { status = "已加入日历"; refresh() }.onFailure { status = it.message.orEmpty() }
+            }
+            AlertDialog.Builder(this).setTitle(date.toString()).setItems(arrayOf("全天", "选择时间")) { _, choice ->
+                if (choice == 0) save(null) else TimePickerDialog(this, { _, hour, minute ->
+                    val lengths = listOf(15L, 30L, 60L, 90L, 120L, 180L)
+                    AlertDialog.Builder(this).setTitle("日程时长").setItems(lengths.map { "$it 分钟" }.toTypedArray()) { _, index ->
+                        save(LocalTime.of(hour, minute), lengths[index])
+                    }.setNegativeButton("取消", null).show()
+                }, 9, 0, true).show()
+            }.setNeutralButton("清除日期") { _, _ ->
+                runCatching { repository.setTaskSchedule(card.cardId, null) }.onSuccess { status = "已移出日历"; refresh() }
+            }.setNegativeButton("取消", null).show()
+        }, initial.year, initial.monthValue - 1, initial.dayOfMonth).show()
+    }
+    private fun showSharedCalendar() {
+        val today = LocalDate.now()
+        DatePickerDialog(this, { _, year, month, day -> showSharedCalendarDay(LocalDate.of(year, month + 1, day)) },
+            today.year, today.monthValue - 1, today.dayOfMonth).show()
+    }
+    private fun showSharedCalendarDay(date: LocalDate) {
+        calendarDialog?.dismiss()
+        val current=++calendarRequest
+        val zone=ZoneId.systemDefault()
+        fun dp(value: Int)=(value*resources.displayMetrics.density).toInt()
+        val content=LinearLayout(this).apply { orientation=LinearLayout.VERTICAL;setPadding(dp(16),dp(8),dp(16),dp(8)) }
+        content.addView(TextView(this).apply { text="正在读取日程…" })
+        val dialog=AlertDialog.Builder(this).setTitle(date.toString())
+            .setView(ScrollView(this).apply { addView(content) })
+            .setPositiveButton("关闭",null).setNeutralButton("换日期") { _,_->showSharedCalendar() }.create()
+        calendarDialog=dialog
+        dialog.setOnDismissListener { if(calendarDialog===dialog){calendarRequest++;calendarDialog=null} }
+        dialog.show()
+        calendarExecutor.execute {
+            val start = date.atStartOfDay(zone).toInstant().toEpochMilli()
+            val end = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+            val result = runCatching {
+                BufferCalendarStore.refresh(this, repository, start, end)
+                repository.calendarEntries(start, end)
+            }
+            runOnUiThread {
+                if(current!=calendarRequest||calendarDialog!==dialog||!dialog.isShowing||isFinishing||isDestroyed)return@runOnUiThread
+                content.removeAllViews()
+                result.onSuccess { entries ->
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALENDAR) != PackageManager.PERMISSION_GRANTED) content.addView(TextView(this).apply { text = "未授权系统日历，仅显示带日期的待办" })
+                if (entries.isEmpty()) content.addView(TextView(this).apply { text = "当天暂无日程" })
+                entries.forEach { event ->
+                    content.addView(LinearLayout(this).apply {
+                        orientation=LinearLayout.VERTICAL
+                        setPadding(dp(6),dp(12),dp(6),dp(12))
+                        addView(TextView(this@MainActivity).apply {
+                            setTextAppearance(android.R.style.TextAppearance_Material_Body1)
+                            text=com.mocharealm.foundation.fabric.buffer.domain.CalendarTimeLabel.format(event,zone)
+                        })
+                        addView(TextView(this@MainActivity).apply {
+                            setTextAppearance(android.R.style.TextAppearance_Material_Subhead)
+                            text="${event.title}${if(event.done) " · 已完成" else ""}"
+                            setPadding(0,dp(4),0,0)
+                        })
+                        val source=event.calendarName.ifBlank { if(event.id==event.cardId) "待办" else "" }
+                        val detail=listOf(source,event.location).filter{it.isNotBlank()}.joinToString(" · ")
+                        if(detail.isNotBlank())addView(TextView(this@MainActivity).apply {
+                            setTextAppearance(android.R.style.TextAppearance_Material_Body1)
+                            text=detail;setPadding(0,dp(4),0,0)
+                        })
+                    })
+                }
+                }.onFailure {
+                    android.util.Log.w("BufferCalendar","Calendar day load failed",it)
+                    status=it.message?:"日历读取失败"
+                    content.addView(TextView(this).apply { text="日历读取失败，原有日程已保留。\n${it.message.orEmpty()}" })
+                }
+            }
+        }
+    }
+
+    private fun showFocusCalendarPolicy(plan: com.mocharealm.foundation.fabric.buffer.domain.FocusPlan) {
+        AlertDialog.Builder(this).setTitle(plan.title)
+            .setItems(arrayOf("到点提醒，确认后开始", "到点自动开始专注", "关闭这项专注安排")) { _, choice ->
+                runCatching { repository.saveFocusPlan(plan.copy(automatic = choice == 1,
+                    state = if (choice == 2) "cancelled" else "scheduled")) }
+                    .onSuccess { status = if (choice == 2) "已关闭" else "已安排"; (application as BufferApplication).careScheduler.onAlarm() }
+                    .onFailure { status = it.message.orEmpty() }
+            }.setNegativeButton("暂不设置", null).show()
+    }
+
+    private fun showFocusCalendar() {
+        pairingExecutor.execute {
+            runCatching { BufferFocusCalendar(this, repository).upcoming().take(100) }.onSuccess { plans -> runOnUiThread {
+                if (plans.isEmpty()) { status = "未来七天没有可选择的日程"; return@runOnUiThread }
+                val formatter = java.time.format.DateTimeFormatter.ofPattern("M月d日 HH:mm").withZone(ZoneId.systemDefault())
+                AlertDialog.Builder(this).setTitle("选择日程")
+                    .setItems(plans.map { "${formatter.format(java.time.Instant.ofEpochMilli(it.begin))} ${it.title}" }.toTypedArray()) { _, index ->
+                        val plan = plans[index]
+                        showFocusCalendarPolicy(plan)
+                    }.setNegativeButton("返回", null).show()
+            } }.onFailure { runOnUiThread { status = it.message ?: "无法读取日程" } }
+        }
+    }
+
     private fun changeMode(next: String) {
+        if (next == "focus" && repository.focusSession()?.active != true) { showFocusStart(); return }
+
         try {
             repository.setMode(next)
             status = "模式已切换为 ${modeLabel(next)}"

@@ -1,0 +1,283 @@
+diff --git a/chips/r528/components/bluetooth/rtk_hci.c b/chips/r528/components/bluetooth/rtk_hci.c
+--- a/chips/r528/components/bluetooth/rtk_hci.c
++++ b/chips/r528/components/bluetooth/rtk_hci.c
+@@ -177,7 +177,7 @@
+       ret = file_read(&dev->filep_uart, &dev->rxbuf[dev->rxlen],
+                       sizeof(dev->rxbuf) - dev->rxlen);
+     }
+-  while (ret < 0 && errno == EINTR);
++  while (ret == -EINTR);
+ 
+   if (ret <= 0)
+     {
+@@ -297,7 +297,7 @@
+     {
+       ret = file_write(&dev->filep_uart, data, len);
+     }
+-  while (ret < 0 && errno == EINTR);
++  while (ret == -EINTR);
+ 
+   if (ret < 0)
+     {
+@@ -322,74 +322,59 @@
+   wlinfo("%s", __func__);
+ }
+ 
++/* Firmware command I/O is bounded: a missing fragment response must not
++ * reserve the HCI stream forever.  filep_h5 is opened nonblocking. */
+ static int hci_recv(struct file *filep, uint8_t *buf, size_t count)
+ {
+-  ssize_t ret;
+-  ssize_t nread = 0;
+-
+-  while (count != nread)
+-    {
+-      ret = file_read(filep, buf + nread, count - nread);
+-      if (ret < 0)
+-        {
+-          if (ret == -EAGAIN)
+-            {
+-              continue;
+-            }
+-          else
+-            {
+-              return ret;
+-            }
+-        }
+-
+-      nread += ret;
+-    }
+-
+-  return nread;
++  size_t done = 0;
++  uint64_t deadline = get_timestamp_us() + 5000000;
++  while (done < count)
++    {
++      ssize_t ret = file_read(filep, buf + done, count - done);
++      if (ret > 0) done += ret;
++      else if (ret == 0) return -EPIPE;
++      else if (ret != -EAGAIN && ret != -EINTR) return ret;
++      if (done == count) break;
++      if (get_timestamp_us() >= deadline) return -ETIMEDOUT;
++      usleep(1000);
++    }
++  return done;
+ }
+ 
+ static int hci_send(struct file *filep, uint8_t *buf, size_t count)
+ {
+-  ssize_t ret;
+-  ssize_t nwritten = 0;
+-
+-  while (nwritten != count)
+-    {
+-      ret = file_write(filep, buf + nwritten, count - nwritten);
+-      if (ret < 0)
+-        {
+-          if (ret == -EAGAIN)
+-            {
+-              continue;
+-            }
+-          else
+-            {
+-              return ret;
+-            }
+-        }
+-
+-      nwritten += ret;
+-    }
+-
+-  return nwritten;
+-}
+-
+-static int hci_send_recv(FAR struct file *filep, unsigned char *command, size_t count)
+-{
+-  if (hci_send(filep, command, count) != count)
+-    {
+-      return -EIO;
+-    }
+-
+-  hci_recv(filep, command, 1);
+-  if (command[0] != HCI_EVENT_PKT)
+-    {
+-      return -EIO;
+-    }
+-
+-  hci_recv(filep, command + 1, sizeof(struct bt_hci_evt_hdr));
+-  hci_recv(filep, command + 3, command[2]);
+-
++  size_t done = 0;
++  uint64_t deadline = get_timestamp_us() + 5000000;
++  while (done < count)
++    {
++      ssize_t ret = file_write(filep, buf + done, count - done);
++      if (ret > 0) done += ret;
++      else if (ret == 0) return -EPIPE;
++      else if (ret != -EAGAIN && ret != -EINTR) return ret;
++      if (done == count) break;
++      if (get_timestamp_us() >= deadline) return -ETIMEDOUT;
++      usleep(1000);
++    }
++  return done;
++}
++
++static int hci_send_recv(FAR struct file *filep, unsigned char *command,
++                         size_t count, size_t capacity)
++{
++  uint8_t opcode[2] = {command[1], command[2]};
++  int ret = hci_send(filep, command, count);
++  if (ret < 0) return ret;
++  ret = hci_recv(filep, command, 1);
++  if (ret < 0) return ret;
++  if (command[0] != HCI_EVENT_PKT) return -EPROTO;
++  ret = hci_recv(filep, command + 1, sizeof(struct bt_hci_evt_hdr));
++  if (ret < 0) return ret;
++  if (command[1] != 0x0e || command[2] < 4 ||
++      (size_t)command[2] + 3 > capacity) return -EPROTO;
++  ret = hci_recv(filep, command + 3, command[2]);
++  if (ret < 0) return ret;
++  if (command[4] != opcode[0] || command[5] != opcode[1] ||
++      command[6] != 0) return -EPROTO;
+   return OK;
+ }
+ 
+@@ -406,7 +391,7 @@
+   command[2] = 0x10;
+   command[3] = 0;
+ 
+-  ret = hci_send_recv(filep, command, 4);
++  ret = hci_send_recv(filep, command, 4, sizeof(command));
+   if (ret != OK)
+     {
+       wlerr("fail, %s ret:%d", __func__, ret);
+@@ -443,7 +428,7 @@
+   command[2] = 0xfc;
+   command[3] = 0;
+ 
+-  ret = hci_send_recv(filep, command, 4);
++  ret = hci_send_recv(filep, command, 4, sizeof(command));
+   if (ret != OK)
+     {
+       wlerr("fail, %s ret:%d", __func__, ret);
+@@ -488,7 +473,7 @@
+     }
+ 
+   memcpy(&command[4], &bt_baudrate, sizeof(uint32_t));
+-  ret = hci_send_recv(filep_h5, command, 8);
++  ret = hci_send_recv(filep_h5, command, 8, sizeof(command));
+   if (ret != OK)
+     {
+       wlerr("fail, %s ret:%d", __func__, ret);
+@@ -528,28 +513,16 @@
+       buffer_size = header_size + command[3];
+ 
+       assert(buffer_size <= (sizeof(command) / sizeof(command[0])));
+-      ret = hci_send(filep, command, buffer_size);
+-      if (ret != buffer_size)
++      uint8_t fragment = command[4];
++      ret = hci_send_recv(filep, command, buffer_size, sizeof(command));
++      if (ret < 0)
+         {
++          printf("Realtek firmware fragment %u failed: %d\n", fragment, ret);
+           return ret;
+         }
+-
+-      hci_recv(filep, command, 1);
+-      if (HCI_EVENT_PKT != command[0])
++      if (command[2] != 5 || (command[7] & 0x7f) != (fragment & 0x7f))
+         {
+-          return -EIO;
+-        }
+-
+-      hci_recv(filep, command + 1, 2);
+-
+-      assert(command[2] <= (sizeof(command) / sizeof(command[0]) - 3));
+-      hci_recv(filep, command + 3, command[2]);
+-
+-      /* Check OpCode and Status */
+-
+-      if (!(command[4] == 0x20 && command[5] == 0xfc) || command[6] != 0x00)
+-        {
+-          return -EIO;
++          return -EPROTO;
+         }
+     }
+ 
+@@ -569,7 +542,7 @@
+   command[2] = 0x0c;
+   command[3] = 0;
+ 
+-  ret = hci_send_recv(filep, command, 4);
++  ret = hci_send_recv(filep, command, 4, sizeof(command));
+   if (ret != OK)
+     {
+       wlerr("fail, %s ret:%d", __func__, ret);
+@@ -599,7 +572,7 @@
+   command[2] = 0x10;
+   command[3] = 0;
+ 
+-  ret = hci_send_recv(filep, command, 4);
++  ret = hci_send_recv(filep, command, 4, sizeof(command));
+   if (ret != OK)
+     {
+       wlerr("fail, %s ret:%d", __func__, ret);
+@@ -681,7 +654,8 @@
+   int ret;
+   uint64_t time;
+ 
+-  ret = file_open(&dev->filep_h5, CONFIG_BT_UART_ON_DEV_NAME, O_RDWR);
++  /* Keep host traffic out until all firmware commands have completed. */
++  ret = file_open(&dev->filep_h5, CONFIG_BT_UART_ON_DEV_NAME, O_RDWR | O_EXCL | O_NONBLOCK);
+   if (ret < 0)
+     {
+       wlerr("fail, filep_h5 open ret:%d", ret);
+@@ -735,15 +709,21 @@
+       goto errout_init;
+     }
+ 
++  ret = uart_bth4_handoff(&dev->filep_h5);
++  if (ret < 0) goto errout_init;
+   dev->state = RTKHCI_STATE_OPENNED;
++  file_close(&dev->filep_h5);
++  printf("Realtek Bluetooth firmware ready\n");
+   return ret;
+ 
+ errout_init:
++  rtkbt_free_fwc_buf();
+   file_close(&dev->filep_h5);
+ errout_open:
+   dev->state = RTKHCI_STATE_CLOSED;
+   rtkbt_board_poweroff();
+   file_close(&dev->filep_uart);
++  printf("Realtek Bluetooth initialization failed: %d\n", ret);
+   return ret;
+ }
+ 
+diff --git a/chips/r528/components/bluetooth/rtk_hci_board.c b/chips/r528/components/bluetooth/rtk_hci_board.c
+--- a/chips/r528/components/bluetooth/rtk_hci_board.c
++++ b/chips/r528/components/bluetooth/rtk_hci_board.c
+@@ -41,6 +41,7 @@
+ static uint32_t rtl_fw_size = 0;
+ static uint8_t *rtl_config = NULL;
+ static uint8_t *rtl_fw = NULL;
++static unsigned int command_offset;
+ 
+ void rtkbt_free_fwc_buf(void)
+ {
+@@ -362,6 +363,7 @@
+ rtkbt_board_find_fw_patch(uint8_t chipid)
+ {
+   (void)chipid;
++  command_offset = 0;
+   uint8_t bdaddr[6];
+   uint8_t ble_bdaddr[6];
+   uint16_t config_len;
+@@ -456,7 +458,7 @@
+ rtkbt_board_fetch_command(uint8_t *command)
+ {
+   unsigned int config_size = rtl_config_size;
+-  static unsigned int command_offset;
++
+   int fragment_size = 0;
+   uint8_t index;
+ 

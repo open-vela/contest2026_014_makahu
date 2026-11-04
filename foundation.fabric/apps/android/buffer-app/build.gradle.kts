@@ -22,6 +22,7 @@ android {
     buildFeatures {
         compose = true
     }
+    sourceSets.getByName("main").assets.srcDir("../../../../data/agent/runtime")
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
@@ -30,9 +31,15 @@ android {
 }
 
 dependencies {
+    implementation("net.sf.biweekly:biweekly:0.6.8")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.17")
-    implementation(project(":fabric-sdk"))
+    // Framework-owned SDK carries the owner/ability-gated BLE Binder API.
+    // The Hub APK must be built from the same framework revision; Buffer never
+    // opens or copies the Hub identity directory across UIDs.
+    val fabricSdkAar = providers.gradleProperty("fabricSdkAar").orNull
+    if (fabricSdkAar == null) implementation(project(":fabric-sdk"))
+    else implementation(files(fabricSdkAar))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -40,4 +47,5 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.health.connect)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }

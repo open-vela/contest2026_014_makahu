@@ -1,0 +1,46 @@
+diff --git a/netutils/ntpclient/ntpclient.c b/netutils/ntpclient/ntpclient.c
+--- a/netutils/ntpclient/ntpclient.c
++++ b/netutils/ntpclient/ntpclient.c
+@@ -1306,25 +1306,25 @@
+       clock_gettime(CLOCK_MONOTONIC, &start_monotonic);
+ 
+       nsamples = 0;
+-      if (netlib_check_ipconnectivity(NULL, 1, 1) > 0)
+-        {
+-          /* Collect samples. */
+-
+-          for (i = 0; i < CONFIG_NETUTILS_NTPCLIENT_NUM_SAMPLES; i++)
++      /* Probe NTP directly. A DNS server need not answer ICMP, and an
++       * ICMP timeout does not imply that DNS or NTP/UDP is unavailable. */
++      /* Collect samples. */
++
++      for (i = 0; i < CONFIG_NETUTILS_NTPCLIENT_NUM_SAMPLES; i++)
++        {
++          /* Get next sample. */
++
++          ret = ntpc_get_ntp_sample(srvs, samples, nsamples);
++          if (ret < 0)
+             {
+-              /* Get next sample. */
+-
+-              ret = ntpc_get_ntp_sample(srvs, samples, nsamples);
+-              if (ret < 0)
+-                {
+-                  errval = errno;
+-                }
+-              else
+-                {
+-                  ++nsamples;
+-                }
++              errval = errno;
+             }
+-        }
++          else
++            {
++              ++nsamples;
++            }
++        }
++
+ 
+       /* Analyse samples. */
+ 

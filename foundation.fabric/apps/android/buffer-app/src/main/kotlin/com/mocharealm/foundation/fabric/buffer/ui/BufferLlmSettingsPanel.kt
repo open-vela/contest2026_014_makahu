@@ -38,10 +38,10 @@ internal fun BufferLlmSettingsPanel() {
             key = ""; hasSavedKey = false
             status = "已选择 MiMo 2.5，请填写对应密钥后保存"
         }) { Text("使用 MiMo 2.5") }
-        OutlinedTextField(url, { url = it }, label = { Text("Base URL") },
+        OutlinedTextField(url, { url = it }, label = { Text("服务地址") },
             placeholder = { Text("https://api.xiaomimimo.com/v1") }, singleLine = true,
             modifier = Modifier.fillMaxWidth(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri))
-        OutlinedTextField(model, { model = it }, label = { Text("大模型名称") },
+        OutlinedTextField(model, { model = it }, label = { Text("模型名称") },
             singleLine = true, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(key, { key = it }, label = { Text("API Key") },
             supportingText = { Text(if (hasSavedKey) "已保存密钥，留空可保留" else "请输入 MiMo 平台 API Key") },
@@ -53,7 +53,7 @@ internal fun BufferLlmSettingsPanel() {
                 hasSavedKey = repository.llmConfig().apiKey.isNotBlank()
                 key = ""; status = "已保存，待处理任务会自动继续"
             } catch (_: Exception) { status = "无法保存，请检查接口地址、模型名称和密钥" }
-        }, modifier = Modifier.fillMaxWidth()) { Text("保存服务配置") }
+        }, modifier = Modifier.fillMaxWidth()) { Text("保存配置") }
         OutlinedButton(enabled = !testing, onClick = {
             testing = true
             scope.launch {
@@ -62,7 +62,7 @@ internal fun BufferLlmSettingsPanel() {
                         val savedKey = if (hasSavedKey && key.isBlank()) repository.llmConfig().apiKey else key
                         val result = BufferLlmClient.complete(BufferLlmConfig(url, model, savedKey),
                             "连接检查，只输出 {\"ok\":true}。", JSONObject().put("task", "connection_check"))
-                        if (result.opt("ok") == true) "大模型连接成功；语音识别会在转写录音时验证" else "已收到响应，但结果格式不符合约定"
+                        if (result.opt("ok") == true) "连接正常；语音识别尚未验证" else "响应格式不符，请检查模型设置"
                     } catch (_: Exception) { "连接失败，请检查服务地址、模型和密钥" }
                 }
                 testing = false

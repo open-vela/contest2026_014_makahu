@@ -1,0 +1,137 @@
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/disp2/disp/lcd/Kconfig b/chips/r528/drivers/rtos-hal/hal/source/disp2/disp/lcd/Kconfig
+index e3222403..b5ad7747 100755
+--- a/chips/r528/drivers/rtos-hal/hal/source/disp2/disp/lcd/Kconfig
++++ b/chips/r528/drivers/rtos-hal/hal/source/disp2/disp/lcd/Kconfig
+@@ -35,6 +35,17 @@ config LCD_SUPPORT_ILI9341
+ 		If you want to support ili9341 panel for display driver, select it.
+ 
+ if LCD_SUPPORT_ILI9341
++config LCD_ILI9341_R528_PWM_BACKLIGHT
++    bool "R528 ILI9341 backlight on PD20 / PWM4"
++    default n
++    depends on ARCH_CHIP_R528 && DRIVERS_PWM && LCD_MAXPOWER > 1
++    depends on !DRIVER_SYSCONFIG
++    ---help---
++      Use the R528 default PWM4 pin mapping (PD20, function 5) for
++      the Gemini S1 ILI9341 SPI backlight. Requires a multilevel
++      LCD_MAXPOWER. Do not enable on panels wired to another pin or
++      when sys_config overrides PWM pin routing.
++
+ config LCD_ILI9341_HARDWARE_SPI
+     bool "Use hardware SPI for ili9341"
+ 	default y
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/disp2/soc/ili9341_lcd_spi.c b/chips/r528/drivers/rtos-hal/hal/source/disp2/soc/ili9341_lcd_spi.c
+index 9c32766e..7d005426 100644
+--- a/chips/r528/drivers/rtos-hal/hal/source/disp2/soc/ili9341_lcd_spi.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/disp2/soc/ili9341_lcd_spi.c
+@@ -37,6 +37,9 @@
+ 
+ #include "hal_gpio.h"
+ #include "hal_timer.h"
++#ifdef CONFIG_LCD_ILI9341_R528_PWM_BACKLIGHT
++#include <sunxi_hal_pwm.h>
++#endif
+ 
+ #include <nuttx/lcd/ili9341.h>
+ #include <nuttx/lcd/lcd.h>
+@@ -505,7 +508,42 @@ static int ili9341_recvgram(struct ili9341_lcd_s *lcd, uint16_t *wd,
+ 
+ static int ili9341_backlight(struct ili9341_lcd_s *lcd, int level)
+ {
+-    /* 如果有背光引脚，在这里实现控制逻辑 */
++    (void)lcd;
++#ifdef CONFIG_LCD_ILI9341_R528_PWM_BACKLIGHT
++    /* sun8iw20_pin.h maps PWM4 to PD20/function 5. Active high matches
++     * the original GPIO-high full-brightness board initialization. */
++    static bool pwm_ready;
++    struct pwm_config config;
++
++    if (level < 0 || level > CONFIG_LCD_MAXPOWER)
++    {
++        return -EINVAL;
++    }
++
++    if (!pwm_ready)
++    {
++        if (hal_pwm_init() != HAL_PWM_STATUS_OK)
++        {
++            return -EIO;
++        }
++        pwm_ready = true;
++    }
++
++    config.period_ns = 20000; /* 50 kHz; level 0 is only for explicit off. */
++    config.duty_ns = (config.period_ns * (uint32_t)level +
++                     CONFIG_LCD_MAXPOWER / 2) / CONFIG_LCD_MAXPOWER;
++    config.polarity = PWM_POLARITY_NORMAL;
++    if (hal_pwm_control(4, &config) != HAL_PWM_STATUS_OK)
++    {
++        return -EIO;
++    }
++#else
++    /* This profile only has on/off power, never advertise multilevel PWM. */
++    if (hal_gpio_set_data(LCD_BACKLIGHT_PIN, level > 0) != 0)
++    {
++        return -EIO;
++    }
++#endif
+     return OK;
+ }
+ 
+@@ -632,15 +670,19 @@ int board_lcd_initialize(void)
+     if (g_lcddev == NULL)
+     {
+         lcdinfo("Initialize ili9341 lcd driver NULL\n");
+-        return ENODEV;
++        return -ENODEV;
+     }
+     lcd_delay_ms(100);
+-    hal_gpio_sel_vol_mode(LCD_BACKLIGHT_PIN, POWER_MODE_330);
+-    hal_gpio_set_driving_level(LCD_BACKLIGHT_PIN, GPIO_DRIVING_LEVEL3);
+-    hal_gpio_set_direction(LCD_BACKLIGHT_PIN, GPIO_DIRECTION_OUTPUT);
+-    hal_gpio_set_pull(LCD_BACKLIGHT_PIN, GPIO_PULL_DOWN_DISABLED);
+-    hal_gpio_set_data(LCD_BACKLIGHT_PIN, 1);
+-    return OK;
++    if (hal_gpio_sel_vol_mode(LCD_BACKLIGHT_PIN, POWER_MODE_330) != 0 ||
++        hal_gpio_set_driving_level(LCD_BACKLIGHT_PIN, GPIO_DRIVING_LEVEL3) != 0 ||
++        hal_gpio_set_direction(LCD_BACKLIGHT_PIN, GPIO_DIRECTION_OUTPUT) != 0 ||
++        hal_gpio_set_pull(LCD_BACKLIGHT_PIN, GPIO_PULL_DOWN_DISABLED) != 0)
++    {
++        return -EIO;
++    }
++    /* setpower owns both the PWM operation and the reported LCD level.
++     * Do not force GPIO output after it has selected the PWM pin function. */
++    return g_lcddev->setpower(g_lcddev, CONFIG_LCD_MAXPOWER);
+ }
+ 
+ /****************************************************************************
+@@ -659,4 +701,4 @@ struct lcd_dev_s *board_lcd_getdev(int lcddev)
+     return NULL;
+ }
+ 
+-#endif /* CONFIG_LCD_ILI9341 */
+\ No newline at end of file
++#endif /* CONFIG_LCD_ILI9341 */
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/pwm/hal_pwm.c b/chips/r528/drivers/rtos-hal/hal/source/pwm/hal_pwm.c
+index bc08580e..95d88b4a 100755
+--- a/chips/r528/drivers/rtos-hal/hal/source/pwm/hal_pwm.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/pwm/hal_pwm.c
+@@ -977,13 +977,14 @@ pwm_status_t hal_pwm_control(int channel, struct pwm_config *config_pwm)
+ {
+     bool bind_mode;
+ 
++    if (channel < 0 || channel >= PWM_NUM || config_pwm == NULL)
++        return HAL_PWM_STATUS_ERROR_PARAMETER;
++
+     bind_mode = pwm_gpio[channel].bind_mode;
+     if (!bind_mode)
+-        hal_pwm_control_single(channel, config_pwm);
++        return hal_pwm_control_single(channel, config_pwm);
+     else
+-        hal_pwm_control_dual(channel, config_pwm);
+-
+-    return 0;
++        return hal_pwm_control_dual(channel, config_pwm);
+ }
+ 
+ pwm_status_t hal_pwm_release_single(int channel)

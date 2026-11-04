@@ -10,8 +10,9 @@ internal fun modeLabel(mode: String): String = when (mode) {
 
 internal fun actionLabel(action: String): String = when (action) {
     "done" -> "完成"
-    "later" -> "稍后再看…"
-    "archive" -> "收起"
+    "reopen" -> "恢复未完成"
+    "later" -> "稍后"
+    "archive" -> "归档"
     "remind" -> "提醒"
     "calendar" -> "加入日程"
     "remove_calendar" -> "移出日程"
@@ -22,7 +23,7 @@ internal fun actionLabel(action: String): String = when (action) {
     "accept_classification" -> "接受分类"
     "edit_classification" -> "编辑分类"
     "reject_classification" -> "拒绝分类"
-    "mark_researched" -> "标记已深入研究"
+    "mark_researched" -> "标为已研究"
     "create_project" -> "建项目草稿"
     "create_article" -> "建文章草稿"
     "create_code_task" -> "建代码任务"
@@ -32,13 +33,14 @@ internal fun actionLabel(action: String): String = when (action) {
 }
 
 internal fun cardStateLabel(state: String): String = when (state) {
+    "source_unavailable" -> "等待来源恢复"
     "pending_transcription" -> "等待转写"
     "classification_rejected" -> "待重新分类"
     "cooling" -> "冷藏中"
     "fermenting" -> "发酵中"
     "converted" -> "已转化"
     "unanswered_gray" -> "未解"
-    "rabbit_hole_candidate" -> "兔子洞候选"
+    "rabbit_hole_candidate" -> "深挖候选"
     "quick_answered" -> "已快速回答"
     "researched" -> "已深入研究"
     "health_synced" -> "已同步健康"

@@ -1,13 +1,12 @@
 """Production binding/receipt persistence with real atomic rename and injected failure."""
+from host_support import PROJECT_ROOT, extract_c, CC
 from pathlib import Path
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 s = (root / 'app/buffer_app/buffer_store.c').read_text()
-a = s.index('static int buffer_write_atomic(')
-b = s.index('\n}', a) + 2
-atomic = s[a:b]
-store = s[s.index('/* Keep the enrollment receipt'):]
+atomic = extract_c(s, 'static int buffer_write_atomic(')
+store = s[s.index('/* Keep the enrollment receipt'):s.index('int buffer_store_capture_target(')]
 harness = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -26,6 +25,12 @@ static int test_rename(const char *from, const char *to)
   return rename(from, to);
 }
 #define rename test_rename
+#include <stdlib.h>
+#define BUFFER_AGENT_JSON_BYTES (64 * 1024)
+static bool buffer_source_is_projection_path(const char *path) { (void)path; return false; }
+static int buffer_source_projection_save(const char *path,const char *raw,const char *type,const char *action)
+{ (void)path;(void)raw;(void)type;(void)action;return -ENOTSUP; }
+
 ''' + atomic + '\n' + store + r'''
 static const char *receipt = "0123456789abcdef0123456789abcdef";
 static char host[96], token[128], phone[80], request[33];
@@ -68,5 +73,5 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='buffer-enrollment-store-') as temporary:
     work = Path(temporary)
     (work / 'test.c').write_text(harness)
-    subprocess.run(['cc','-Wall','-Wextra','-Werror','-pthread',str(work/'test.c'),'-o',str(work/'test')],check=True)
+    subprocess.run([*CC,'-Wall','-Wextra','-Werror','-pthread',str(work/'test.c'),'-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],cwd=work,check=True,timeout=5)

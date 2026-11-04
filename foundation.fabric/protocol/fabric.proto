@@ -120,6 +120,7 @@ message SessionPrepare {
   bytes plan_hash = 5;
   DeviceId sender_device_id = 6;
   bytes message_nonce = 7;
+  uint64 coordinator_term = 8;
 }
 
 message SessionReady {
@@ -129,6 +130,7 @@ message SessionReady {
   bytes plan_hash = 4;
   DeviceId sender_device_id = 5;
   bytes message_nonce = 6;
+  uint64 coordinator_term = 7;
 }
 
 message SessionCommit {
@@ -138,6 +140,7 @@ message SessionCommit {
   bytes plan_hash = 4;
   DeviceId sender_device_id = 5;
   bytes message_nonce = 6;
+  uint64 coordinator_term = 7;
 }
 
 message SessionAbort {
@@ -229,6 +232,10 @@ enum MessageType {
   E2EE_KEY_ACCEPT = 57;
   GROUP_KEY_ROTATE = 58;
   POLICY_DENIED = 59;
+  COORDINATOR_ELECTION_REQUEST = 60;
+  COORDINATOR_ELECTION_VOTE = 61;
+  COORDINATOR_ELECTION_CERTIFICATE = 62;
+  COORDINATOR_ELECTION_HEARTBEAT = 63;
 }
 
 message ControlStreamHello { uint64 link_generation = 1; }
@@ -241,6 +248,55 @@ message SessionControlHeader {
   uint64 expected_epoch = 3;
   DeviceId sender_device_id = 4;
   bytes message_nonce = 5;
+}
+
+// Election controls are authenticated with the same device/session header as
+// other Session messages. The request/vote signatures bind the fields below,
+// while the header supplies nonce replay protection and exact epoch gating.
+message CoordinatorElectionRequest {
+  SessionControlHeader header = 1;
+  uint64 term = 2;
+  bytes membership_hash = 3;
+  uint64 committed_epoch = 4;
+  bytes committed_plan_hash = 5;
+  Id128 candidate = 6;
+  DeviceId candidate_device = 7;
+  bytes candidate_public_key = 8;
+  bytes signature = 9;
+}
+
+message CoordinatorElectionVoteRecord {
+  uint64 term = 1;
+  bytes membership_hash = 2;
+  uint64 committed_epoch = 3;
+  bytes committed_plan_hash = 4;
+  Id128 candidate = 5;
+  Id128 voter = 6;
+  DeviceId voter_device = 7;
+  bytes voter_public_key = 8;
+  bytes signature = 9;
+}
+
+message CoordinatorElectionVote {
+  SessionControlHeader header = 1;
+  CoordinatorElectionVoteRecord vote = 2;
+}
+
+message CoordinatorElectionCertificate {
+  SessionControlHeader header = 1;
+  uint64 term = 2;
+  bytes membership_hash = 3;
+  uint64 committed_epoch = 4;
+  bytes committed_plan_hash = 5;
+  Id128 candidate = 6;
+  repeated CoordinatorElectionVoteRecord votes = 7;
+}
+
+message CoordinatorElectionHeartbeat {
+  SessionControlHeader header = 1;
+  uint64 term = 2;
+  Id128 coordinator = 3;
+  bytes committed_plan_hash = 4;
 }
 
 message SessionCounterOffer { SessionControlHeader header = 1; bytes encoded_plan = 2; }

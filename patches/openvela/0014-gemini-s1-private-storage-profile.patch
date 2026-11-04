@@ -1,0 +1,956 @@
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/nand_flash/nuttx_nand_init.c b/chips/r528/drivers/rtos-hal/hal/source/nand_flash/nuttx_nand_init.c
+--- a/chips/r528/drivers/rtos-hal/hal/source/nand_flash/nuttx_nand_init.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/nand_flash/nuttx_nand_init.c
+@@ -898,11 +898,13 @@
+ 		return -EIO;
+ 
+ 	switch (cmd) {
+-	case BIOC_FLUSH:
++	case BIOC_FLUSH: {
++		int ret;
+ 		nand_lock();
+-		blk->flush_write_cache(blk, 0xFFFFFFFF);
++		ret = blk->flush_write_cache(blk, 0xFFFFFFFF);
+ 		nand_unlock();
+-		return 0;
++		return ret < 0 ? ret : ret == 0 ? 0 : -EIO;
++	}
+ 	}
+ 	return -ENOTTY;
+ }
+@@ -1229,11 +1231,13 @@
+ 		return -EIO;
+ 
+ 	switch (cmd) {
+-	case BIOC_FLUSH:
++	case BIOC_FLUSH: {
++		int ret;
+ 		nand_lock();
+-		blk->flush_write_cache(blk, 0xFFFFFFFF);
++		ret = blk->flush_write_cache(blk, 0xFFFFFFFF);
+ 		nand_unlock();
+-		return 0;
++		return ret < 0 ? ret : ret == 0 ? 0 : -EIO;
++	}
+ 	}
+ 	return -ENOTTY;
+ }
+@@ -1435,7 +1439,7 @@
+ #endif
+ 	nand_unlock();
+ 	pr_debug("return %d\n", (int)(nblocks - failed));
+-	return nblocks - failed;
++	return failed ? -EIO : (int)nblocks;
+ }
+ 
+ static ssize_t nand_phy_bread(FAR struct mtd_dev_s *mtd, off_t startblock, size_t nblocks, FAR uint8_t *buffer)
+@@ -1448,7 +1452,8 @@
+ 	int err_cnt = 0;
+ 
+ 	pr_debug("startblock: %u, nblocks: %u\n", (unsigned int)startblock, (unsigned int)nblocks);
+-	nand_phy_bread_check(dev, startblock, nblocks, buffer);
++	if (nand_phy_bread_check(dev, startblock, nblocks, buffer))
++		return -EINVAL;
+ 	chip = dev->nand_info->ChipNum;
+ 	page_per_blk = dev->nand_info->PageNumsPerBlk;
+ 	page_size = 512 * dev->nand_info->SectorNumsPerPage;
+@@ -1468,7 +1473,7 @@
+ 		if (ret) {
+ 			if (ret == -EUCLEAN)
+ 				correct_cnt++;
+-			else if (ret == -EBADMSG)
++			else
+ 				err_cnt++;
+ 		}
+ 
+@@ -1529,7 +1534,8 @@
+ 	off_t i;
+ 
+ 	pr_debug("startblock: %u, nblocks: %u\n", (unsigned int)startblock, (unsigned int)nblocks);
+-	nand_phy_bwrite_check(dev, startblock, nblocks, buffer);
++	if (nand_phy_bwrite_check(dev, startblock, nblocks, buffer))
++		return -EINVAL;
+ 	chip = dev->nand_info->ChipNum;
+ 	page_per_blk = dev->nand_info->PageNumsPerBlk;
+ 	page_size = 512 * dev->nand_info->SectorNumsPerPage;
+@@ -1600,8 +1606,9 @@
+ 	}
+ 	case BIOC_FLUSH: {
+ 		struct _nftl_blk *blk = dev_to_blk(dev);
+-		blk->flush_write_cache(blk, 0xFFFFFFFF);
+-		ret = OK;
++		ret = blk->flush_write_cache(blk, 0xFFFFFFFF);
++		if (ret > 0)
++			ret = -EIO;
+ 		break;
+ 	}
+ 	default:
+@@ -1832,7 +1839,7 @@
+ 			pr_err("%s sector range: [%u, %u) (%u)\n",
+ 				(const char *)disk->name, (unsigned int)used_sects,
+ 				(unsigned int)(used_sects + disk->size), (unsigned int)disk->size);
+-			goto err_out;
++			return -EINVAL;
+ 		}
+ 
+ 		part->index = index + 1;
+@@ -1849,9 +1856,13 @@
+ 
+ 		ret = register_mtdpartition(part->path, 0, dev->phy_path, part->start_page, part->npage);
+ 		pr_debug("register_mtdpartition(%s) return %d\n", part->path, ret);
++		if (ret < 0)
++			return ret;
+ 
+ 		ret = register_mtdpartition(part->by_name, 0, dev->phy_path, part->start_page, part->npage);
+ 		pr_debug("register_mtdpartition(%s) return %d\n", part->by_name, ret);
++		if (ret < 0)
++			return ret;
+ 
+ #ifdef NAND_PHY_PARA_CHECK
+ 		if (!strcmp("sst", (const char *)disk->name)) {
+@@ -1868,8 +1879,6 @@
+ #endif
+ 
+ 	return 0;
+-err_out:
+-	return -1;
+ }
+ #endif
+ 
+@@ -1985,14 +1994,21 @@
+ 	ret = nand_init_mtddriver(nand_dev);
+ 	if (ret) {
+ 		pr_err("nand_init_mtddriver failed\n");
+-	}
+-
+-	register_mtddriver(nand_dev->phy_path, &nand_dev->mtd, 0, &nand_dev->mtd);
++		return ret;
++	}
++
++	ret = register_mtddriver(nand_dev->phy_path, &nand_dev->mtd, 0, &nand_dev->mtd);
++	if (ret < 0)
++		return ret;
+ 
+ 
+ 	ret = nand_register_mtdpartition(nand_dev);
+ 	if (ret) {
+ 		pr_err("nand_register_mtdpartition failed\n");
++		/* Logical/partial physical drivers already hold nand_dev references.
++		 * Keep them alive; report failure instead of freeing their backend or
++		 * claiming that the requested private partition was registered. */
++		return ret;
+ 	}
+ #endif
+ 
+diff --git a/lichee/tools/scripts/pack_img.sh b/lichee/tools/scripts/pack_img.sh
+--- a/lichee/tools/scripts/pack_img.sh
++++ b/lichee/tools/scripts/pack_img.sh
+@@ -79,7 +79,7 @@
+ DEFINE_string 'debug_mode' 'uart0' 'config debug mode, e.g. uart0, card0' 'd'
+ DEFINE_string 'signture' 'none' 'pack boot signture to do secure boot' 's'
+ DEFINE_string 'secure' 'none' 'pack secure boot with -v arg' 'v'
+-DEFINE_string 'mode' 'normal' 'pack dump firmware' 'm'
++DEFINE_string 'mode' 'normal' 'normal, dump, or buffer-private-factory (S1 new layout only)' 'm'
+ DEFINE_string 'topdir' 'none' 'sdk top dir' 't'
+ DEFINE_string 'programmer' '' 'creat programmer img or not' 'w'
+ DEFINE_string 'tar_image' '' 'creat downloadfile img .tar.gz or not' 'i'
+@@ -695,6 +695,15 @@
+ 
+ function do_prepare()
+ {
++	# This explicit factory mode is separate from the ordinary partition table.
++	# It must never silently produce a legacy-layout image for the private app.
++	if [ "x${PACK_MODE}" = "xbuffer-private-factory" ]; then
++		if [ "x${PACK_PROJECT_PATH}" != "xr528s3/gemini-s1_nand" ] ||
++		   [ ! -f "${PACK_TOPDIR}/board/${PACK_PROJECT_PATH}/configs/sys_partition_buffer_private.fex" ]; then
++			pack_error "buffer-private-factory requires the Gemini-S1 NAND factory layout"
++			exit 1
++		fi
++	fi
+ 	rm -rf ${ROOT_DIR}/${PACK_PROJECT_PATH}/image
+ 	mkdir -p ${ROOT_DIR}/${PACK_PROJECT_PATH}/image
+ 
+@@ -712,6 +721,10 @@
+ 		cp -vf ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/sys_partition_dump.fex ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/sys_partition.fex
+ 		cp -vf ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/sys_partition_nor_dump.fex ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/sys_partition_nor.fex
+ 		cp -vf ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/usbtool_test.fex ${ROOT_DIR}/${PACK_PROJECT_PATH}/image/usbtool.fex
++	fi
++	if [ "x${PACK_MODE}" = "xbuffer-private-factory" ]; then
++		cp -f "${PACK_TOPDIR}/board/${PACK_PROJECT_PATH}/configs/sys_partition_buffer_private.fex" \
++			"${ROOT_DIR}/${PACK_PROJECT_PATH}/image/sys_partition.fex" || exit 1
+ 	fi
+ 
+ 	local config_xip=0;
+@@ -841,6 +854,9 @@
+ 
+ 
+ 	IMG_NAME="${IMG_NAME}${IMG_FLASH}"
++	if [ "x${PACK_MODE}" = "xbuffer-private-factory" ]; then
++		IMG_NAME="${IMG_NAME}_buffer-private-factory"
++	fi
+ 
+ 	if [ "x${PACK_SECURE}" != "xnone" -o "x${PACK_SIG}" != "xnone" ]; then
+ 		if [ -f "${ROOT_DIR}/${PACK_PROJECT_PATH}/image/version_base.mk" ]; then
+diff --git a/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig b/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig
+new file mode 100644
+--- /dev/null
++++ b/boards/r528/r528s3-gemini-s1/configs/buffer-private/defconfig
+@@ -0,0 +1,632 @@
++# Buffer private NAND factory profile, based on nsh_minidisplay (ILI9341).
++# Not an in-place update. Pack with -m buffer-private-factory.
++# See Buffer docs/finals/34-s1-private-storage.md.
++#
++# This file is autogenerated: PLEASE DO NOT EDIT IT.
++#
++# You can use "make menuconfig" to make any modifications to the installed .config file.
++# You can then do "make savedefconfig" to generate a new defconfig file that includes your
++# modifications.
++#
++# CONFIG_BINFMT_DISABLE is not set
++# CONFIG_BT_GATT_CACHING is not set
++# CONFIG_BT_HCI_ACL_FLOW_CONTROL is not set
++# CONFIG_DEBUG_ERROR is not set
++# CONFIG_DISABLE_ENVIRON is not set
++# CONFIG_DISABLE_MQUEUE is not set
++# CONFIG_DISABLE_POSIX_TIMERS is not set
++# CONFIG_DISABLE_PSEUDOFS_OPERATIONS is not set
++# CONFIG_DISABLE_PTHREAD is not set
++# CONFIG_DISABLE_SIGNALS is not set
++# CONFIG_FS_PROCFS_EXCLUDE_BLOCKS is not set
++# CONFIG_FS_PROCFS_EXCLUDE_CPUINFO is not set
++# CONFIG_FS_PROCFS_EXCLUDE_ENVIRON is not set
++# CONFIG_FS_PROCFS_EXCLUDE_MEMDUMP is not set
++# CONFIG_FS_PROCFS_EXCLUDE_MEMINFO is not set
++# CONFIG_FS_PROCFS_EXCLUDE_MOUNT is not set
++# CONFIG_FS_PROCFS_EXCLUDE_MOUNTS is not set
++# CONFIG_FS_PROCFS_EXCLUDE_NET is not set
++# CONFIG_FS_PROCFS_EXCLUDE_PARTITIONS is not set
++# CONFIG_FS_PROCFS_EXCLUDE_PROCESS is not set
++# CONFIG_FS_PROCFS_EXCLUDE_TCBINFO is not set
++# CONFIG_FS_PROCFS_EXCLUDE_UPTIME is not set
++# CONFIG_FS_PROCFS_EXCLUDE_USAGE is not set
++# CONFIG_FS_PROCFS_EXCLUDE_VERSION is not set
++# CONFIG_LV_USE_GENERIC_MIPI is not set
++# CONFIG_MBEDTLS_NET_C is not set
++# CONFIG_MMCSD_HAVE_CARDDETECT is not set
++# CONFIG_NSH_DISABLEBG is not set
++# CONFIG_NSH_DISABLESCRIPT is not set
++# CONFIG_NSH_DISABLE_BASENAME is not set
++# CONFIG_NSH_DISABLE_BOOT is not set
++# CONFIG_NSH_DISABLE_CAT is not set
++# CONFIG_NSH_DISABLE_CD is not set
++# CONFIG_NSH_DISABLE_CMP is not set
++# CONFIG_NSH_DISABLE_CP is not set
++# CONFIG_NSH_DISABLE_DATE is not set
++# CONFIG_NSH_DISABLE_DD is not set
++# CONFIG_NSH_DISABLE_DF is not set
++# CONFIG_NSH_DISABLE_DIRNAME is not set
++# CONFIG_NSH_DISABLE_DMESG is not set
++# CONFIG_NSH_DISABLE_ECHO is not set
++# CONFIG_NSH_DISABLE_ENV is not set
++# CONFIG_NSH_DISABLE_ERROR_PRINT is not set
++# CONFIG_NSH_DISABLE_EXEC is not set
++# CONFIG_NSH_DISABLE_EXIT is not set
++# CONFIG_NSH_DISABLE_EXPORT is not set
++# CONFIG_NSH_DISABLE_EXPR is not set
++# CONFIG_NSH_DISABLE_FDINFO is not set
++# CONFIG_NSH_DISABLE_FREE is not set
++# CONFIG_NSH_DISABLE_GET is not set
++# CONFIG_NSH_DISABLE_HEXDUMP is not set
++# CONFIG_NSH_DISABLE_IFCONFIG is not set
++# CONFIG_NSH_DISABLE_IFUPDOWN is not set
++# CONFIG_NSH_DISABLE_ITEF is not set
++# CONFIG_NSH_DISABLE_KILL is not set
++# CONFIG_NSH_DISABLE_LOSETUP is not set
++# CONFIG_NSH_DISABLE_LS is not set
++# CONFIG_NSH_DISABLE_MB is not set
++# CONFIG_NSH_DISABLE_MH is not set
++# CONFIG_NSH_DISABLE_MKDIR is not set
++# CONFIG_NSH_DISABLE_MKFIFO is not set
++# CONFIG_NSH_DISABLE_MKRD is not set
++# CONFIG_NSH_DISABLE_MOUNT is not set
++# CONFIG_NSH_DISABLE_MV is not set
++# CONFIG_NSH_DISABLE_MW is not set
++# CONFIG_NSH_DISABLE_PIDOF is not set
++# CONFIG_NSH_DISABLE_PKILL is not set
++# CONFIG_NSH_DISABLE_PS is not set
++# CONFIG_NSH_DISABLE_PUT is not set
++# CONFIG_NSH_DISABLE_PWD is not set
++# CONFIG_NSH_DISABLE_REBOOT is not set
++# CONFIG_NSH_DISABLE_RESET_CAUSE is not set
++# CONFIG_NSH_DISABLE_RM is not set
++# CONFIG_NSH_DISABLE_RMDIR is not set
++# CONFIG_NSH_DISABLE_SEMICOLON is not set
++# CONFIG_NSH_DISABLE_SET is not set
++# CONFIG_NSH_DISABLE_SHUTDOWN is not set
++# CONFIG_NSH_DISABLE_SLEEP is not set
++# CONFIG_NSH_DISABLE_SOURCE is not set
++# CONFIG_NSH_DISABLE_TEST is not set
++# CONFIG_NSH_DISABLE_TIME is not set
++# CONFIG_NSH_DISABLE_TOP is not set
++# CONFIG_NSH_DISABLE_UMOUNT is not set
++# CONFIG_NSH_DISABLE_UNAME is not set
++# CONFIG_NSH_DISABLE_UNSET is not set
++# CONFIG_NSH_DISABLE_UPTIME is not set
++# CONFIG_NSH_DISABLE_USLEEP is not set
++# CONFIG_NSH_DISABLE_WAIT is not set
++# CONFIG_NSH_DISABLE_WATCH is not set
++# CONFIG_NSH_DISABLE_WGET is not set
++# CONFIG_NSH_DISABLE_XD is not set
++# CONFIG_ONESHOT_AS_TICK is not set
++# CONFIG_STANDARD_SERIAL is not set
++# CONFIG_STDIO_LINEBUFFER is not set
++CONFIG_ADBD_FILE_SERVICE=y
++CONFIG_ADBD_LOGCAT_SERVICE=y
++CONFIG_ADBD_PAYLOAD_SIZE=4096
++CONFIG_ADBD_SHELL_SERVICE=y
++CONFIG_ADBD_SOCKET_SERVICE=y
++CONFIG_ADBD_STACKSIZE=8192
++CONFIG_ADBD_USB_BOARDCTL=y
++CONFIG_ADBD_USB_SERVER=y
++CONFIG_ADC=y
++CONFIG_ALLOW_BSD_COMPONENTS=y
++CONFIG_ALLOW_GPL_COMPONENTS=y
++CONFIG_ALLOW_MIT_COMPONENTS=y
++CONFIG_ANALOG=y
++CONFIG_ARCH="arm"
++CONFIG_ARCH_BOARD_CUSTOM=y
++CONFIG_ARCH_BOARD_CUSTOM_DIR="../vendor/allwinnertech/boards/r528/r528s3-gemini-s1"
++CONFIG_ARCH_BOARD_CUSTOM_DIR_RELPATH=y
++CONFIG_ARCH_BOARD_CUSTOM_NAME="nsh"
++CONFIG_ARCH_BOARD_PARTITION_TABLE="../vendor/allwinnertech/lichee/board/r528s3/gemini-s1_nand/configs/sys_partition_buffer_private.fex"
++CONFIG_ARCH_BOARD_R528S3_GEMINI_S1=y
++CONFIG_ARCH_BOARD_R528S3_GEMINI_XTS=y
++CONFIG_ARCH_CHIP_ARM_CUSTOM=y
++CONFIG_ARCH_CHIP_CUSTOM=y
++CONFIG_ARCH_CHIP_CUSTOM_DIR="../vendor/allwinnertech/chips/r528"
++CONFIG_ARCH_CHIP_CUSTOM_DIR_RELPATH=y
++CONFIG_ARCH_CHIP_CUSTOM_NAME="r528"
++CONFIG_ARCH_CHIP_R528=y
++CONFIG_ARCH_INTERRUPTSTACK=8192
++CONFIG_ARCH_LOWVECTORS=y
++CONFIG_ARCH_SETJMP_H=y
++CONFIG_ARCH_STACKDUMP=y
++CONFIG_ARMV7A_MEMCHR=y
++CONFIG_ARMV7A_MEMCPY=y
++CONFIG_ARMV7A_MEMMOVE=y
++CONFIG_ARMV7A_STRCMP=y
++CONFIG_ARMV7A_STRLEN=y
++CONFIG_ARM_THUMB=y
++CONFIG_AUDIO=y
++CONFIG_AUDIOUTILS_NXAUDIO_LIB=y
++CONFIG_AUDIO_CUSTOM_DEV_PATH=y
++CONFIG_AUDIO_DRIVER_SPECIFIC_BUFFERS=y
++CONFIG_AUDIO_EXCLUDE_VOLUME=y
++CONFIG_AW_AUDIO_CODEC=y
++CONFIG_AW_DRIVERS_AUDIO=y
++CONFIG_BLUETOOTH=y
++CONFIG_BLUETOOTH_A2DP=y
++CONFIG_BLUETOOTH_A2DP_SINK=y
++CONFIG_BLUETOOTH_BLE_ADV=y
++CONFIG_BLUETOOTH_BLE_SCAN=y
++CONFIG_BLUETOOTH_BLE_SUPPORT=y
++CONFIG_BLUETOOTH_FRAMEWORK_SOCKET_IPC=y
++CONFIG_BLUETOOTH_IPC_JOIN_LOOP=y
++CONFIG_BLUETOOTH_LE_ADVERTISER_MAX_NUM=4
++CONFIG_BLUETOOTH_SERVER=y
++CONFIG_BLUETOOTH_SERVICE=y
++CONFIG_BLUETOOTH_SLIP=y
++CONFIG_BLUETOOTH_SLIP_TXBUFSIZE=4160
++CONFIG_BLUETOOTH_STACK_BREDR_ZBLUE=y
++CONFIG_BLUETOOTH_STACK_LE_ZBLUE=y
++CONFIG_BLUETOOTH_TOOLS=y
++CONFIG_BLUETOOTH_UART=y
++CONFIG_BOARDCTL_BOOT_IMAGE=y
++CONFIG_BOARDCTL_RESET=y
++CONFIG_BOARDCTL_RESET_CAUSE=y
++CONFIG_BOARD_EARLY_INITIALIZE=y
++CONFIG_BOARD_INITTHREAD_STACKSIZE=4096
++CONFIG_BOARD_LATE_INITIALIZE=y
++CONFIG_BOARD_LOOPSPERMSEC=49341
++CONFIG_BOOT_RUNFROMSDRAM=y
++CONFIG_BT=y
++CONFIG_BT_A2DP=y
++CONFIG_BT_A2DP_SINK=y
++CONFIG_BT_ATT_TX_COUNT=30
++CONFIG_BT_BUF_ACL_RX_SIZE=676
++CONFIG_BT_BUF_CMD_TX_COUNT=6
++CONFIG_BT_BUF_CMD_TX_SIZE=68
++CONFIG_BT_BUF_EVT_DISCARDABLE_COUNT=10
++CONFIG_BT_BUF_EVT_RX_SIZE=68
++CONFIG_BT_CLASSIC=y
++CONFIG_BT_DEBUG_LOG=y
++CONFIG_BT_DEBUG_LOG_FUNCTION_NAME=y
++CONFIG_BT_DEBUG_LOG_LEVEL=7
++CONFIG_BT_DEBUG_LOG_LINE_NUMBER=y
++CONFIG_BT_DEVICE_NAME="Openvela"
++CONFIG_BT_DEVICE_NAME_DYNAMIC=y
++CONFIG_BT_DEVICE_NAME_MAX=64
++CONFIG_BT_EXT_ADV_LEGACY_SUPPORT=y
++CONFIG_BT_EXT_ADV_MAX_ADV_SET=2
++CONFIG_BT_GATT_AUTO_DISCOVER_CCC=y
++CONFIG_BT_GATT_AUTO_UPDATE_MTU=y
++CONFIG_BT_GATT_CLIENT=y
++CONFIG_BT_GATT_DYNAMIC_DB=y
++CONFIG_BT_H4=y
++CONFIG_BT_HCI_TX_STACK_SIZE=4096
++CONFIG_BT_HCI_TX_STACK_SIZE_WITH_PROMPT=y
++CONFIG_BT_L2CAP_TX_MTU=498
++CONFIG_BT_LIGHTCTRL=y
++CONFIG_BT_LIGHTCTRL_STACKSIZE=28672
++CONFIG_BT_MAX_CONN=5
++CONFIG_BT_MAX_PAIRED=10
++CONFIG_BT_POWER_MODE_CONTROL=y
++CONFIG_BT_PRIVACY=y
++CONFIG_BT_RX_STACK_SIZE=4096
++CONFIG_BT_SAMPLE=y
++CONFIG_BT_START=y
++CONFIG_BT_START_STACKSIZE=28672
++CONFIG_BUILTIN=y
++CONFIG_COMPONENTS_AW_ALSA_UTILS=y
++CONFIG_COMPONENTS_AW_ALSA_UTILS_ALOOP=y
++CONFIG_COMPONENTS_AW_EQ_TEST=y
++CONFIG_COMPONENTS_AW_TINY_ALSA_LIB=y
++CONFIG_COMPONENTS_BLUETOOTH=y
++CONFIG_CRYPTO=y
++CONFIG_CRYPTO_CRYPTODEV=y
++CONFIG_CRYPTO_CRYPTODEV_HARDWARE=y
++CONFIG_CXX_EXCEPTION=y
++CONFIG_CXX_RTTI=y
++CONFIG_DEBUG_FEATURES=y
++CONFIG_DEBUG_FULLOPT=y
++CONFIG_DEBUG_SYMBOLS=y
++CONFIG_DEBUG_UORB=y
++CONFIG_DEFAULT_SMALL=y
++CONFIG_DETECT_CARD=y
++CONFIG_DEV_GPIO=y
++CONFIG_DEV_NULL=y
++CONFIG_DEV_URANDOM=y
++CONFIG_DEV_ZERO=y
++CONFIG_DHCPC_RENEW_STACKSIZE=2048000
++CONFIG_DISABLE_MQUEUE_SYSV=y
++CONFIG_DISP2_SUNXI=y
++CONFIG_DRIVERS_BLUETOOTH=y
++CONFIG_DRIVERS_CCMU=y
++CONFIG_DRIVERS_CIR_RX=y
++CONFIG_DRIVERS_CIR_TX=y
++CONFIG_DRIVERS_DMA=y
++CONFIG_DRIVERS_EFUSE=y
++CONFIG_DRIVERS_G2D=y
++CONFIG_DRIVERS_GPADC=y
++CONFIG_DRIVERS_GPIO=y
++CONFIG_DRIVERS_GPIO_IOEXPANDER_INTERRUPT=y
++CONFIG_DRIVERS_HTIMER=y
++CONFIG_DRIVERS_IEEE80211=y
++CONFIG_DRIVERS_LEDC=y
++CONFIG_DRIVERS_LRADC=y
++CONFIG_DRIVERS_MSGBOX=y
++CONFIG_DRIVERS_NAND_FLASH=y
++CONFIG_DRIVERS_NOTE_TASKNAME_BUFSIZE=1024
++CONFIG_DRIVERS_PWM=y
++CONFIG_DRIVERS_RC=y
++CONFIG_DRIVERS_SDMMC=y
++CONFIG_DRIVERS_SDMMC_FS=y
++CONFIG_DRIVERS_SOUND=y
++CONFIG_DRIVERS_SPI=y
++CONFIG_DRIVERS_SUNXI_CCU=y
++CONFIG_DRIVERS_TIMER=y
++CONFIG_DRIVERS_TIMER_AVS=y
++CONFIG_DRIVERS_TPADC=y
++CONFIG_DRIVERS_VIDEO=y
++CONFIG_DRIVERS_WIRELESS=y
++CONFIG_DRVR_READAHEAD=y
++CONFIG_DRVR_WRITEBUFFER=y
++CONFIG_ELF=y
++CONFIG_ETC_ROMFS=y
++CONFIG_EXAMPLES_ADC=y
++CONFIG_EXAMPLES_ADC_DEVPATH="/dev/input/event1"
++CONFIG_EXAMPLES_FB=y
++CONFIG_EXAMPLES_FB_STACKSIZE=8192
++CONFIG_EXAMPLES_GPIO=y
++CONFIG_EXAMPLES_LEDS=y
++CONFIG_EXAMPLES_LEDS_LEDSET=0x01
++CONFIG_EXAMPLES_LVGLDEMO=y
++CONFIG_EXAMPLES_LVGLDEMO_STACKSIZE=40960
++CONFIG_FAT_DIRECT_RETRY=y
++CONFIG_FAT_LCNAMES=y
++CONFIG_FB_SYNC=y
++CONFIG_FILE_STREAM=y
++CONFIG_FS_BINFS=y
++CONFIG_FS_FAT=y
++CONFIG_FS_FATFS=y
++CONFIG_FS_FATFS_SECTOR_RATIO=256
++CONFIG_FS_LARGEFILE=y
++CONFIG_FS_LOCK_BUCKET_SIZE=8
++CONFIG_FS_PROCFS=y
++CONFIG_FS_PROCFS_REGISTER=y
++CONFIG_FS_ROMFS=y
++CONFIG_FS_ROMFS_CACHE_NODE=y
++CONFIG_FS_TMPFS=y
++CONFIG_FS_YAFFS=y
++CONFIG_FTL_WRITEBUFFER=y
++CONFIG_GPIO_LOWER_HALF=y
++CONFIG_GRAPHICS_LVGL=y
++CONFIG_GT911_IIC_TOUCH=y
++CONFIG_HAL_TEST_DISP=y
++CONFIG_HAL_TEST_GPADC=y
++CONFIG_I2C=y
++CONFIG_IDLETHREAD_STACKSIZE=20480
++CONFIG_IEEE80211_REALTEK_WIFI=y
++CONFIG_IEEE80211_REALTEK_WIFI_RTL8733BS=y
++CONFIG_IMAGE_PACK_PATH="../vendor/allwinnertech/lichee/board/r528s3/gemini-s1_nand/configs/nsh.fex"
++CONFIG_INIT_ENTRYPOINT="nsh_main"
++CONFIG_INIT_STACKSIZE=16384
++CONFIG_INPUT=y
++CONFIG_INPUT_BUTTONS=y
++CONFIG_IOB_BUFSIZE=1600
++CONFIG_IOB_NBUFFERS=3072
++CONFIG_IOB_THROTTLE=256
++CONFIG_IOEXPANDER=y
++CONFIG_IRQ_WORK_STACKSIZE=4096
++CONFIG_KVDB=y
++CONFIG_LCD=y
++CONFIG_LCD_DEV=y
++CONFIG_LCD_EXTERNINIT=y
++CONFIG_LCD_FRAMEBUFFER=y
++CONFIG_LCD_ILI9341=y
++CONFIG_LCD_ILI9341_IFACE0=y
++CONFIG_LCD_ILI9341_R528_PWM_BACKLIGHT=y
++CONFIG_LCD_MAXPOWER=255
++CONFIG_LCD_SUPPORT_ILI9341=y
++CONFIG_LED_RGB_TEST=y
++CONFIG_LED_RGB_WS2812=y
++CONFIG_LIBCXXTOOLCHAIN=y
++CONFIG_LIBC_LONG_LONG=y
++CONFIG_LIBM=y
++CONFIG_LIBSUPCXX=y
++CONFIG_LIBUV=y
++CONFIG_LIBUV_EXTENSION=y
++CONFIG_LIBUV_THREAD_STACKSIZE=12288
++CONFIG_LIB_CARES=y
++CONFIG_LIB_CURL_CA_PATH="/etc/ssl/certs"
++CONFIG_LIB_CURL_PTHREAD_STACKSIZE=61440
++CONFIG_LIB_FREETYPE=y
++CONFIG_LIB_PNG=y
++CONFIG_LIB_SSH=y
++CONFIG_LIB_ZLIB=y
++CONFIG_LINE_MAX=256
++CONFIG_LTO_FULL=y
++CONFIG_LUNCHER_MINI_APP=y
++CONFIG_BUFFER_VELA_NIGHT_DIM=y
++CONFIG_LV_BIN_DECODER_RAM_LOAD=y
++CONFIG_LV_CACHE_DEF_SIZE=1048576
++CONFIG_LV_CALENDAR_WEEK_STARTS_MONDAY=y
++CONFIG_LV_DEF_REFR_PERIOD=16
++CONFIG_LV_DEMO_MUSIC_SQUARE=y
++CONFIG_LV_DRAW_BUF_ALIGN=1
++CONFIG_LV_DRAW_BUF_STRIDE_ALIGN=16
++CONFIG_LV_DRAW_SW_ASM_NEON=y
++CONFIG_LV_ENABLE_GLOBAL_CUSTOM=y
++CONFIG_LV_FONT_MONTSERRAT_10=y
++CONFIG_LV_FONT_MONTSERRAT_12=y
++CONFIG_LV_FONT_MONTSERRAT_16=y
++CONFIG_LV_FONT_MONTSERRAT_18=y
++CONFIG_LV_FONT_MONTSERRAT_20=y
++CONFIG_LV_FONT_MONTSERRAT_30=y
++CONFIG_LV_FONT_MONTSERRAT_48=y
++CONFIG_LV_FONT_MONTSERRAT_8=y
++CONFIG_LV_FS_POSIX_LETTER=47
++CONFIG_LV_FS_POSIX_PATH="/"
++CONFIG_LV_GPU_G2D_INCLUDE_PATH="nuttx/arch/arm/src/chip/drivers/rtos-hal/hal nuttx/arch/arm/src/chip/drivers/rtos-hal/hal/source/g2d_rcq nuttx/arch/arm/src/chip/drivers/rtos-hal/include/hal nuttx/arch/arm/src/armv7-a nuttx/arch/arm/src/chip/drivers/rtos-hal/include/osal"
++CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=128
++CONFIG_LV_THEME_DEFAULT_DARK=y
++CONFIG_LV_USE_CLIB_MALLOC=y
++CONFIG_LV_USE_CLIB_SPRINTF=y
++CONFIG_LV_USE_CLIB_STRING=y
++CONFIG_LV_USE_DEMO_KEYPAD_AND_ENCODER=y
++CONFIG_LV_USE_DEMO_MUSIC=y
++CONFIG_LV_USE_DEMO_WIDGETS=y
++CONFIG_LV_USE_DRAW_G2D=y
++CONFIG_LV_USE_FREETYPE=y
++CONFIG_LV_USE_FS_POSIX=y
++CONFIG_LV_USE_ILI9341=y
++CONFIG_LV_USE_IMGFONT=y
++CONFIG_LV_USE_LIBPNG=y
++CONFIG_LV_USE_LOG=y
++CONFIG_LV_USE_NUTTX=y
++CONFIG_LV_USE_NUTTX_LCD=y
++CONFIG_LV_USE_NUTTX_TOUCHSCREEN=y
++CONFIG_LV_USE_QRCODE=y
++CONFIG_MBEDTLS_THREADING_C=y
++CONFIG_MBEDTLS_THREADING_PTHREAD=y
++CONFIG_MEDIA=y
++CONFIG_MICRO_TF=y
++CONFIG_MMCSD=y
++CONFIG_MMCSD_SDIO=y
++CONFIG_MQ_MAXMSGSIZE=1024
++CONFIG_MTD=y
++CONFIG_MTD_BYTE_WRITE=y
++CONFIG_MTD_CONFIG=y
++CONFIG_MTD_CONFIG_NAMED=y
++CONFIG_MTD_PARTITION=y
++CONFIG_NET=y
++CONFIG_NETDB_BUFSIZE=512
++CONFIG_NETDB_DNSCLIENT=y
++CONFIG_NETDB_DNSCLIENT_RECV_TIMEOUT=2
++CONFIG_NETDB_DNSSERVER_NAMESERVERS=8
++CONFIG_NETDB_HOSTCONF_PATH="/tmp/hosts"
++CONFIG_NETDB_HOSTFILE=y
++CONFIG_NETDB_MAX_IPv4ADDR=4
++CONFIG_NETDB_RESOLVCONF=y
++CONFIG_NETDB_RESOLVCONF_PATH="/tmp/resolv.conf"
++CONFIG_NETDEV_LATEINIT=y
++CONFIG_NETDEV_PHY_IOCTL=y
++CONFIG_NETDEV_STATISTICS=y
++CONFIG_NETDEV_WIRELESS_IOCTL=y
++CONFIG_NETDOWN_NOTIFIER=y
++CONFIG_NETINIT_THREAD=y
++CONFIG_NETINIT_WAPI_ALG_TKIP=y
++CONFIG_NETINIT_WAPI_AUTHWPA_WPA_WPA2=y
++CONFIG_NETINIT_WAPI_CIPHERMODE_TKIP=y
++CONFIG_NETLINK_ALLOC_CONNS=1
++CONFIG_NETLINK_ROUTE=y
++CONFIG_NETUTILS_CJSON=y
++CONFIG_NETUTILS_DHCPC_RECV_TIMEOUT_MS=200
++CONFIG_NETUTILS_DHCPC_RETRIES=20
++CONFIG_NETUTILS_NTPCLIENT_STACKSIZE=3072
++CONFIG_NET_ALLOC_DEVIF_CALLBACKS=1
++CONFIG_NET_ARPTAB_SIZE=48
++CONFIG_NET_ARP_IPIN=y
++CONFIG_NET_BLUETOOTH=y
++CONFIG_NET_BROADCAST=y
++CONFIG_NET_DEFAULT_MIN_PORT=5001
++CONFIG_NET_GUARDSIZE=16
++CONFIG_NET_ICMP_ALLOC_CONNS=1
++CONFIG_NET_ICMP_NPOLLWAITERS=2
++CONFIG_NET_ICMP_SOCKET=y
++CONFIG_NET_IGMP=y
++CONFIG_NET_IPFRAG=y
++CONFIG_NET_LOCAL=y
++CONFIG_NET_LOCAL_SCM=y
++CONFIG_NET_LOOPBACK=y
++CONFIG_NET_LOOPBACK_PKTSIZE=128
++CONFIG_NET_MAX_RECV_BUFSIZE=4423680
++CONFIG_NET_MAX_SEND_BUFSIZE=4423680
++CONFIG_NET_NETLINK=y
++CONFIG_NET_PKT=y
++CONFIG_NET_PKT_ALLOC_CONNS=1
++CONFIG_NET_RECV_BUFSIZE=16384
++CONFIG_NET_SEND_BUFSIZE=16384
++CONFIG_NET_STATISTICS=y
++CONFIG_NET_TCP=y
++CONFIG_NET_TCPBACKLOG=y
++CONFIG_NET_TCP_ALLOC_CONNS=4
++CONFIG_NET_TCP_DELAYED_ACK=y
++CONFIG_NET_TCP_KEEPALIVE=y
++CONFIG_NET_TCP_MAX_CONNS=32
++CONFIG_NET_TCP_NWRBCHAINS=128
++CONFIG_NET_TCP_PREALLOC_CONNS=16
++CONFIG_NET_TCP_RTO=1
++CONFIG_NET_TCP_SELECTIVE_ACK=y
++CONFIG_NET_TCP_WRITE_BUFFERS=y
++CONFIG_NET_UDP=y
++CONFIG_NET_UDP_ALLOC_CONNS=1
++CONFIG_NET_UDP_MAX_CONNS=5
++CONFIG_NET_UDP_NOTIFIER=y
++CONFIG_NET_UDP_NWRBCHAINS=64
++CONFIG_NET_UDP_WRITE_BUFFERS=y
++CONFIG_NSH_ALIAS=y
++CONFIG_NSH_ALTCONDEV=y
++CONFIG_NSH_ARCHINIT=y
++CONFIG_NSH_ARGCAT=y
++CONFIG_NSH_BUILTIN_APPS=y
++CONFIG_NSH_CMDOPT_DD_STATS=y
++CONFIG_NSH_CMDOPT_HEXDUMP=y
++CONFIG_NSH_CMDPARMS=y
++CONFIG_NSH_MAXARGUMENTS=16
++CONFIG_NSH_NESTDEPTH=6
++CONFIG_NSH_PROMPT_MAX=256
++CONFIG_NSH_QUOTE=y
++CONFIG_NXPLAYER_MAINTHREAD_STACKSIZE=3072
++CONFIG_NXRECORDER_MAINTHREAD_STACKSIZE=3072
++CONFIG_PTHREAD_MUTEX_TYPES=y
++CONFIG_PTHREAD_STACK_DEFAULT=4096
++CONFIG_PWM=y
++CONFIG_R528_AUDIO=y
++CONFIG_R528_DDR_MAPSIZE=8388608
++CONFIG_R528_IRQ_WD=y
++CONFIG_R528_TWI0=y
++CONFIG_R528_TWI2=y
++CONFIG_R528_UART1=y
++CONFIG_R528_UART2=y
++CONFIG_R528_WATCHDOG=y
++CONFIG_RAMLOG=y
++CONFIG_RAMLOG_BUFSIZE=102400
++CONFIG_RAMLOG_SYSLOG=y
++CONFIG_RAMMTD=y
++CONFIG_RAM_SIZE=961943040
++CONFIG_RAM_START=0x41400000
++CONFIG_RAM_VSTART=0x41400000
++CONFIG_RAW_BINARY=y
++CONFIG_READLINE_CMD_HISTORY=y
++CONFIG_READLINE_TABCOMPLETION=y
++CONFIG_SCHED_BACKTRACE=y
++CONFIG_SCHED_CHILD_STATUS=y
++CONFIG_SCHED_HAVE_PARENT=y
++CONFIG_SCHED_HPWORKPRIORITY=254
++CONFIG_SCHED_HPWORKSTACKSIZE=16384
++CONFIG_SCHED_INSTRUMENTATION_WDOG=y
++CONFIG_SCHED_LPWORKSTACKSIZE=4096
++CONFIG_SDIO_BLOCKSETUP=y
++CONFIG_SDIO_IRQ_SUPPORT=y
++CONFIG_SENSORS=y
++CONFIG_SENSORS_LTR553=y
++CONFIG_SENSORS_SGP30_UORB=y
++CONFIG_SENSORS_SHTC3=y
++CONFIG_SIG_DEFAULT=y
++CONFIG_SIG_EVTHREAD=y
++CONFIG_SIG_EVTHREAD_HPWORK=y
++CONFIG_SMP=y
++CONFIG_SMP_NCPUS=2
++CONFIG_SND_CODEC_SUN8IW20_AUDIOCODEC=y
++CONFIG_SND_COMMON_SUNXI_ALG_CFG=y
++CONFIG_SND_SOC_SUNXI_RXSYNC=y
++CONFIG_SND_SUNXI_DEBUG=y
++CONFIG_SPECIFIC_DRIVERS=y
++CONFIG_SPI_DRIVER=y
++CONFIG_SPI_TRIGGER=y
++CONFIG_STACK_CANARIES=y
++CONFIG_STACK_COLORATION=y
++CONFIG_STACK_USAGE=y
++CONFIG_SUNXI_DISP2_FB_HW_ROTATION_SUPPORT=y
++CONFIG_SYMTAB_ORDEREDBYNAME=y
++CONFIG_SYSLOG_BUFFER=y
++CONFIG_SYSLOG_BUFSIZE=256
++CONFIG_SYSLOG_DEFAULT=y
++CONFIG_SYSLOG_DEVPATH="/dev/ttyS1"
++CONFIG_SYSLOG_INTBUFFER=y
++CONFIG_SYSLOG_MAX_CHANNELS=2
++CONFIG_SYSLOG_PREFIX=y
++CONFIG_SYSLOG_PREFIX_STRING="nsh"
++CONFIG_SYSLOG_PROCESSID=y
++CONFIG_SYSLOG_REGISTER=y
++CONFIG_SYSLOG_TIMESTAMP=y
++CONFIG_SYSLOG_TIMESTAMP_FORMAT="%y/%m/%e %H:%M:%S"
++CONFIG_SYSLOG_TIMESTAMP_FORMATTED=y
++CONFIG_SYSLOG_TIMESTAMP_LOCALTIME=y
++CONFIG_SYSLOG_TIMESTAMP_REALTIME=y
++CONFIG_SYSTEM_ADBD=y
++CONFIG_SYSTEM_DHCPC_RENEW=y
++CONFIG_SYSTEM_DUMPSTACK=y
++CONFIG_SYSTEM_DUMPSTACK_STACKSIZE=204800
++CONFIG_SYSTEM_I2CTOOL=y
++CONFIG_SYSTEM_NSH=y
++CONFIG_SYSTEM_NSH_STACKSIZE=4096
++CONFIG_SYSTEM_NTPC=y
++CONFIG_SYSTEM_NXCODEC=y
++CONFIG_SYSTEM_NXLOOPER=y
++CONFIG_SYSTEM_NXPLAYER=y
++CONFIG_SYSTEM_NXRECORDER=y
++CONFIG_SYSTEM_PING=y
++CONFIG_SYSTEM_PING_STACKSIZE=3072
++CONFIG_SYSTEM_SETLOGMASK=y
++CONFIG_SYSTEM_SYSTEM=y
++CONFIG_SYSTEM_TCPDUMP=y
++CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=16384
++CONFIG_SYSTEM_YMODEM=y
++CONFIG_SYSTEM_YMODEM_STACKSIZE=4096
++CONFIG_TESTING_CMOCKA=y
++CONFIG_TESTING_DRIVER_TEST=y
++CONFIG_TIMER=y
++CONFIG_TIMER_FD=y
++CONFIG_TLS_TASK_NELEM=4
++CONFIG_TTY_FORCE_PANIC=y
++CONFIG_TTY_SIGINT=y
++CONFIG_UART1_RXBUFSIZE=4096
++CONFIG_UART1_RXDMA=y
++CONFIG_UART1_TXDMA=y
++CONFIG_UART2_BAUD=1500000
++CONFIG_UART2_SERIAL_CONSOLE=y
++CONFIG_UART_BTH4=y
++CONFIG_UART_BTH5=y
++CONFIG_UART_BTH5_RXBUFSIZE=2048
++CONFIG_UART_BTH5_TXBUFSIZE=1024
++CONFIG_UNQLITE=y
++CONFIG_UORB=y
++CONFIG_UORB_LISTENER=y
++CONFIG_UORB_TESTS=y
++CONFIG_USB=y
++CONFIG_USBADB=y
++CONFIG_USBDEV=y
++CONFIG_USBDEV_DUALSPEED=y
++CONFIG_USB_DEVICE=y
++CONFIG_USB_GADGET=y
++CONFIG_USEC_PER_TICK=1000
++CONFIG_USENSOR=y
++CONFIG_USERLED=y
++CONFIG_USERLED_LOWER=y
++CONFIG_USE_MMC=y
++CONFIG_USE_SD=y
++CONFIG_USE_SDIO=y
++CONFIG_USE_SDMMC_MULT=y
++CONFIG_UTILS_CURL=y
++CONFIG_UTILS_IPERF2=y
++CONFIG_UTILS_SSH=y
++CONFIG_VIDEO_FB=y
++CONFIG_WIFI_TEST=y
++CONFIG_WIRELESS=y
++CONFIG_WIRELESS_BLUETOOTH=y
++CONFIG_WIRELESS_WAPI=y
++CONFIG_WIRELESS_WAPI_CMDTOOL=y
++CONFIG_WIRELESS_WAPI_CONFIG_PATH="/private/wapi.conf"
++CONFIG_WIRELESS_WAPI_INITCONF=y
++CONFIG_WIRELESS_WAPI_SCAN_MAX_DATA=8192
++CONFIG_WIRELESS_WAPI_STACKSIZE=204800
++CONFIG_WS2812=y
++CONFIG_WS2812_NON_SPI_DRIVER=y
++CONFIG_LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP=y
++CONFIG_BUFFER_VELA_S1_PRIVATE_STORAGE=y
++CONFIG_BUFFER_VELA_SOURCE_JOURNAL=y
++CONFIG_BUFFER_VELA_DATA_DIR="/private/buffer"
++CONFIG_MTD_DHARA=y
++CONFIG_DHARA_GC_RATIO=4
++CONFIG_DHARA_READ_NCACHES=16
++CONFIG_FS_LITTLEFS=y
++CONFIG_FS_LITTLEFS_ATTR_UPDATE=y
++CONFIG_FS_LITTLEFS_PROGRAM_SIZE_FACTOR=1
++CONFIG_FS_LITTLEFS_READ_SIZE_FACTOR=1
++CONFIG_FS_LITTLEFS_CACHE_SIZE_FACTOR=1
++CONFIG_FS_LITTLEFS_BLOCK_SIZE_FACTOR=1
++CONFIG_FS_LITTLEFS_NAME_MAX=255
++CONFIG_NAME_MAX=255
++CONFIG_NETUTILS_NETINIT=y
++CONFIG_NETUTILS_DHCPC=y
++CONFIG_CRYPTO_MBEDTLS=y
++CONFIG_BLUETOOTH_FRAMEWORK=y
++CONFIG_BLUETOOTH_GATT_SERVER=y
++CONFIG_BT_SMP=y
++CONFIG_BUFFER_VELA_BLE=y
++CONFIG_BUFFER_VELA_FABRIC=y
++CONFIG_AUDIOUTILS_ALSA_LIB=y
+diff --git a/lichee/board/r528s3/gemini-s1_nand/configs/sys_partition_buffer_private.fex b/lichee/board/r528s3/gemini-s1_nand/configs/sys_partition_buffer_private.fex
+new file mode 100644
+--- /dev/null
++++ b/lichee/board/r528s3/gemini-s1_nand/configs/sys_partition_buffer_private.fex
+@@ -0,0 +1,108 @@
++;---------------------------------------------------------------------------------------------------------
++; 说明： 脚本中的字符串区分大小写，用户可以修改"="后面的数值，但是不要修改前面的字符串;
++;---------------------------------------------------------------------------------------------------------
++
++
++;--------------------------------------------------------------------------------------------------
++;                                   固件下载参数配置
++;--------------------------------------------------------------------------------------------------
++;****************************************************
++;    mbr的大小, 以Kbyte为单位
++;****************************************************
++[mbr]
++size = 256
++
++;********************************************************************************************************
++;                                              分区配置
++;
++;
++;  partition 定义范例:
++;    [partition]                ;  //表示是一个分区
++;    name        = USERFS2      ; //分区名称
++;    size        = 16384        ; //分区大小 单位: 扇区.分区表示个数最多2^31 * 512 = 2T
++;    downloadfile = "123.fex"   ; //下载文件的路径和名称，可以使用相对路径，相对是指相对于image.cfg文件所在分区。也可以使用绝对路径
++;    keydata     = 1            ; //私有数据分区，重新量产数据将不丢失
++;    encrypt     = 1            ; //采用加密方式烧录，将提供数据加密，但损失烧录速度
++;    user_type   = ?            ; //私有用法
++;    verify      = 1            ; //要求量产完成后校验是否正确
++;
++; 注：1、name唯一, 不允许同名
++;     2、name最大12个字符
++;     3、size = 0, 将创建一个无大小的空分区
++;     4、为了安全和效率考虑，分区大小最好保证为16M字节的整数倍
++;********************************************************************************************************
++[partition_start]
++
++; 5M logic space
++[partition]
++    name         = bootloader0
++    size         = 2048
++;    downloadfile = "bl.fex"
++    user_type    = 0x8000
++
++; used to separate logical and physical partitions
++; partition does not exist, size can be the total capacity of the flash (such as 524288 for 256MB)
++[partition]
++    name         = dummy_1
++    size         = 262144
++    user_type    = 0x8000
++
++[partition]
++    name         = boot0-direct
++    size         = 2048
++    user_type    = 0x8000
++
++[partition]
++    name         = uboot-direct
++    size         = 8192
++    user_type    = 0x8000
++
++[partition]
++    name         = reserved_1
++    size         = 2048
++    user_type    = 0x8000
++
++; used to separate logical and physical partitions
++; partition does not exist, size can be the total capacity of the flash (such as 524288 for 256MB)
++; phy block48 - block944 (896 blocks) for user
++[partition]
++    name         = sst
++    size         = 2560
++    user_type    = 0x8000
++
++[partition]
++     name         = bootloader
++     size         = 16384
++     user_type    = 0x8000
++	 downloadfile = "nsh.fex"
++
++;[partition]
++;    name         = tee
++;    size         = 6144
++;    downloadfile = "tee.fex"
++;    user_type    = 0x8000
++
++;[partition]
++;    name         = tee2
++;    size         = 6144
++;    downloadfile = "tee.fex"
++;    user_type    = 0x8000
++
++[partition]
++    name         = res
++    size         = 51200
++    downloadfile = "res.fex"
++    user_type    = 0x8000
++
++; Factory-only layout: raw erased 64 MiB for Dhara + LittleFS.
++; No downloadfile: initialize explicitly on the device; never write a FAT image.
++[partition]
++    name         = bufpriv
++    size         = 131072
++    user_type    = 0x8000
++
++[partition]
++    name         = usrdata
++    size         = 310784
++    downloadfile = "usrdata.fex"
++    user_type    = 0x8000
+diff --git a/chips/r528/drivers/rtos-hal/hal/source/nand_flash/src/build_nand_partition.c b/chips/r528/drivers/rtos-hal/hal/source/nand_flash/src/build_nand_partition.c
+index b320f0fb..2d8f6ac1 100755
+--- a/chips/r528/drivers/rtos-hal/hal/source/nand_flash/src/build_nand_partition.c
++++ b/chips/r528/drivers/rtos-hal/hal/source/nand_flash/src/build_nand_partition.c
+@@ -215,7 +215,7 @@ struct _nand_partition *build_nand_partition(struct _nand_phy_partition *phy_par
+ 	partition->nand_is_blk_good    = nand_is_blk_good;
+ 	partition->nand_mark_bad_blk   = nand_mark_bad_blk;
+ 
+-	MEMCPY(partition->name, "nand_partition0", 31);
++	MEMCPY(partition->name, "nand_partition0", sizeof("nand_partition0"));
+ 	partition->name[14] += phy_partition->PartitionNO;
+ 	NFTL_DBG("[ND]%s\n", partition->name);
+ 

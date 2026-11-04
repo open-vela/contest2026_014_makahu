@@ -1,10 +1,13 @@
 package com.mocharealm.foundation.fabric.ipc;
 
 import android.os.ParcelFileDescriptor;
+import com.mocharealm.foundation.fabric.ipc.IFabricMessageCallback;
 import com.mocharealm.foundation.fabric.ipc.IFabricAbility;
 import com.mocharealm.foundation.fabric.ipc.IFabricResultCallback;
 
 interface IFabricHub {
+    /** Raw 32-byte DeviceId derived from the Hub-owned Fabric BLE identity. */
+    byte[] localDeviceId();
     void registerAbility(String ability, String packageName, IFabricAbility callback);
     void unregisterAbility(String ability, String packageName);
     String[] devices();
@@ -32,4 +35,26 @@ interface IFabricHub {
     long sessionLocalToGroupNs(String deviceId, long localNs);
 
     long sessionClockUncertaintyNs(String deviceId);
+    /** Portable BLE ReliableMessages only. Hub owns identity, pairing, GATT and
+     * committed Session; caller must own a live registered ability. */
+    long openBleMessages(String address, in byte[] qrPublicKey, String ability,
+                         in byte[] channelId, in byte[] localPortId, in byte[] peerPortId,
+                         int maxMessageBytes, IFabricMessageCallback callback);
+    void confirmBlePairing(long connectionId, int shortCode, boolean accepted);
+    boolean sendBleMessage(long connectionId, in byte[] payload);
+    void closeBleMessages(long connectionId);
+
+    /** Selected provider only. Live invocation origin: authenticated remote
+     * DeviceId, or this Hub's DeviceId for local IPC. Null after expiry or
+     * completion. Origin identity is not a grant to perform later actions. */
+    byte[] invocationPeer(long requestId);
+
+    /** Provider-owned reliable-message Session. config is opaque application
+     * binding data, not a claimed platform principal or an application grant. */
+    String openApplicationSession(in String[] deviceIds, String ability, in byte[] config);
+    boolean applicationSessionActive(String sessionId);
+    long invokeSession(String sessionId, String deviceId, String ability,
+                       in byte[] payload, IFabricResultCallback callback);
+    /** Selected provider only; live Session and opaque application binding. */
+    String invocationSession(long requestId);
 }

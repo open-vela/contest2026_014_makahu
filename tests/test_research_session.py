@@ -1,11 +1,12 @@
 """Production research parser and monotonic display, without board hardware."""
+from host_support import PROJECT_ROOT, SDK_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 main = (root / 'app/buffer_app/buffer_app_main.c').read_text()
 wire = (root / 'app/buffer_app/buffer_wire.c').read_text()
-cjson = root.parent / 'apps/netutils/cjson/cJSON'
+cjson = SDK_ROOT / 'apps/netutils/cjson/cJSON'
 def section(source, start, end):
     begin = source.index(start)
     return source[begin:source.index(end, begin)]
@@ -19,7 +20,9 @@ harness = r'''
 struct buffer_runtime_s g_buffer = {.lock = PTHREAD_MUTEX_INITIALIZER};
 static int64_t now = 1000;
 static int64_t buffer_monotonic_ms(void) { return now; }
-''' + section(main, 'int buffer_sync_research(', 'int buffer_sync_focus_config(') + section(
+''' + section(main, 'static bool research_known', 'static void research_tick(') + section(
+    main, 'int buffer_sync_research(', 'struct focus_reminder_state_s'
+) + section(
     wire, 'static bool buffer_wire_valid_device_id(', 'static void buffer_wire_load_standalone_state('
 ) + section(wire, 'static int buffer_parse_research(', 'static int buffer_parse_focus_config(') + r'''
 int main(void) {
@@ -38,7 +41,8 @@ int main(void) {
   assert(buffer_research_snapshot(text, sizeof(text)) && strstr(text, "时间到"));
   g_buffer.mode_dirty = true;
   strcpy(config.id, "research-2");
-  assert(buffer_sync_research(&config) == 0 && strcmp(g_buffer.research.id, "research-1") == 0);
+  assert(buffer_sync_research(&config) == -EAGAIN && strcmp(g_buffer.research.id, "research-1") == 0 &&
+         g_buffer.research.active && g_buffer.research_deadline == 121000);
   assert(!buffer_research_snapshot(text, sizeof(text)));
   g_buffer.mode_dirty = false;
   assert(buffer_sync_research(&config) == 0 && g_buffer.research_deadline == now + 120000);
@@ -47,7 +51,7 @@ int main(void) {
   strcpy(g_buffer.mode, "normal");
   assert(buffer_research_snapshot(text, sizeof(text)) && strstr(text, "已结束"));
   config.active = true; config.remaining_ms = 120000; config.reason[0] = 0;
-  assert(buffer_sync_research(&config) == 0 && !g_buffer.research.active);
+  assert(buffer_sync_research(&config) == -EAGAIN && !g_buffer.research.active);
   strcpy(g_buffer.mode, "bedtime");
   assert(!buffer_research_snapshot(text, sizeof(text)));
   cJSON *session = cJSON_GetObjectItem(root, "research_session");
@@ -70,7 +74,7 @@ with tempfile.TemporaryDirectory(prefix='buffer-research-') as temporary:
     (work / 'nuttx').mkdir()
     (work / 'nuttx/config.h').write_text('')
     (work / 'test.c').write_text(harness)
-    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(work),
+    subprocess.run([*CC, '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(work),
                     '-I', str(root / 'app/buffer_app'), '-I', str(cjson),
                     str(work / 'test.c'), str(cjson / 'cJSON.c'), '-lm', '-o', str(work / 'test')], check=True)
     subprocess.run([str(work / 'test')], check=True, timeout=10)
