@@ -1,0 +1,3 @@
+-keep class com.mocharealm.foundation.fabric.ble.FabricBleNative { *; }
+-keepclassmembers class * implements com.mocharealm.foundation.fabric.ble.FabricBlePolicy { public boolean authorize(byte[], int); }
+-keepclassmembers class * implements com.mocharealm.foundation.fabric.ble.FabricBlePairingStore { public boolean persistPeer(byte[], byte[]); }

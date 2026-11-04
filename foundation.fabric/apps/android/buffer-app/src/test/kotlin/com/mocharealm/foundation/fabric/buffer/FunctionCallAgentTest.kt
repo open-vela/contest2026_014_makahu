@@ -2,7 +2,6 @@ package com.mocharealm.foundation.fabric.buffer
 
 import android.app.Application
 import com.mocharealm.foundation.fabric.buffer.data.llm.BufferCaptureAgent
-import com.mocharealm.foundation.fabric.buffer.data.llm.BufferClassificationJob
 import com.mocharealm.foundation.fabric.buffer.data.llm.BufferLlmConfig
 import com.mocharealm.foundation.fabric.buffer.data.local.BufferRepository
 import com.sun.net.httpserver.HttpServer

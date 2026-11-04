@@ -1,0 +1,20 @@
+diff --git a/audioutils/alsa-lib/pcm_hw.c b/audioutils/alsa-lib/pcm_hw.c
+index 535f7c3a9..719a6c4b4 100644
+--- a/audioutils/alsa-lib/pcm_hw.c
++++ b/audioutils/alsa-lib/pcm_hw.c
+@@ -143,9 +143,13 @@ static int snd_pcm_hw_close(FAR snd_pcm_t *pcm)
+   buf_desc.u.buffer = NULL;
+ 
+   if (hw->status->state == AUDIO_STATE_DRAINING ||
+-      hw->status->state == AUDIO_STATE_OPEN)
++      hw->status->state == AUDIO_STATE_OPEN ||
++      hw->status->state == AUDIO_STATE_PREPARED)
+     {
+-      while (pcm->appl > hw->status->tail)
++      /* Prepared capture buffers have been queued but no worker has started.
++       * Waiting for their return would deadlock; release them directly. */
++      while (hw->status->state != AUDIO_STATE_PREPARED &&
++             pcm->appl > hw->status->tail)
+         {
+           snd_pcm_wait(pcm, -1);
+         }

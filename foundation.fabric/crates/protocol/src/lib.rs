@@ -38,6 +38,9 @@ pub const MAX_REASON_BYTES: usize = 1024;
 pub const MAX_RESUME_TOKEN_BYTES: usize = 4096;
 pub const MAX_KEY_MATERIAL_BYTES: usize = 64 * 1024;
 pub const MAX_E2EE_HEADER_BYTES: usize = 64 * 1024;
+/// Negotiated via the authenticated HubHello feature list before any election
+/// control message is sent to a peer.
+pub const COORDINATOR_ELECTION_FEATURE: &str = "coordinator-election-v1";
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {

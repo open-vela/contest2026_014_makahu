@@ -62,11 +62,29 @@ Coordinator 不负责：
 - 自动拥有所有数据流；
 - 读取 E2EE payload。
 
-Coordinator 离线时：
+Coordinator 离线时不得按设备类型、手机/Hub 角色或业务身份硬编码优先级。选举必须以当前
+已提交成员集合为固定投票组，候选人须获得严格多数成员的、可验证的签名投票。投票前先将
+`(session_id, term, voted_for)` 持久化；同一成员每个 term 只能投一票。投票请求绑定成员集合、
+当前已提交 epoch 和 plan hash，过期请求或冲突投票必须拒绝。没有多数证书时保持 `Suspended`。
 
-- 若契约允许重新选举，按确定性优先级选举；
-- 新 Coordinator 必须提出 `epoch + 1` 的重配置；
-- 若不允许选举，Session 进入 Suspended 并最终关闭。
+新 Coordinator 取得证书后，Session 状态机要求 `term` 单调增加，并只接受该 term 的
+Prepare/Ready/Commit/Reconfigure；重配置须推进 `epoch + 1`。首阶段成员集合固定，成员加入、
+移除和替换需要单独授权的 membership transition，目前会被拒绝。多源/多目标数据路由仍由
+Router 按 SessionPlan 编译，不因 Coordinator 选举变成单一中心转发。
+
+实现边界：`fabric-session` 提供按 DeviceId 计票的签名多数证书、持久化单轮单票接口及
+term-aware 状态机；`SessionCommand::Persist` 也携带 Coordinator 和 term。`fabric-storage` 提供
+SQLite vote store。Hub 网络控制协议和 LinkServices 尚未接入投票消息、持久化 store 与选举
+触发/超时；当前网络 Prepare/Ready/Commit 仍使用初始 term 0。因此这些原语不能被当作已经可
+自动恢复的分布式选举，Coordinator Link 丢失时在接入完整控制面前必须保持 Suspended。Router
+已有多源、多目标计划路由与 fanout 测试；Hub 已接入 QUIC ReliableMessages 的 stream demux
+与 SDK MessagePort，并从内部 Active Session、活跃 IPC principal/ability 和逐次 capability grant
+检查授权，拒绝外部伪造 plan。当前端口以 peer/channel 定向接入并在该 peer 内 fanout，尚未接入
+完整 InMemoryRouter 的多节点转发；不能把已有 Router 单元测试算作整图路由接通。
+四节点旧协调者离线的测试明确验证：3/4 证书只授权新协调者控制，状态保持 Suspended；
+新 plan 仍缺离线成员 Ready，commit 必须失败。禁止通过旧 plan Resume 假装接管完成。
+重启恢复也必须先加载已提交 plan 与 election store 并核对
+epoch/hash；无法证明二者一致时不得投票或恢复 Active。
 
 ## 4. 路由表
 

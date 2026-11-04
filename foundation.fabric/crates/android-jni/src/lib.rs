@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, mpsc},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -50,6 +50,7 @@ use std::os::fd::{FromRawFd, RawFd};
 static RUNTIME: OnceLock<Mutex<Option<RuntimeHandle>>> = OnceLock::new();
 const ECHO_SCHEMA: &[u8] = include_bytes!("../../../examples/echo-ability/schemas/control.proto");
 const BROKER_STREAM_HEADER: &[u8] = b"fabric-app-broker-v1";
+const APPLICATION_SESSION_HEADER: &[u8] = b"fabric-app-session-v1";
 const DEVICE_ONLINE_GRACE_MS: u64 = 10_000;
 const RECONNECT_INTERVAL_MS: u64 = 25_000;
 const DEVICE_ADDRESS_FILE: &str = "trusted-addresses.txt";
@@ -61,6 +62,9 @@ const RELAY_PAIR_TIMEOUT: Duration = Duration::from_secs(10);
 const PAIR_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 enum Command {
+    ReloadTrust {
+        response: mpsc::Sender<Result<(), String>>,
+    },
     Register {
         ability: String,
         package: String,
@@ -94,6 +98,17 @@ enum Command {
         payload: Vec<u8>,
         response: mpsc::Sender<Result<Vec<u8>, String>>,
     },
+    InvokeSession {
+        session: String,
+        device: String,
+        ability: String,
+        payload: Vec<u8>,
+        response: mpsc::Sender<Result<Vec<u8>, String>>,
+    },
+    ApplicationSessionActive {
+        session: String,
+        response: mpsc::Sender<Result<(), String>>,
+    },
     OpenRemoteStream {
         device: String,
         ability: String,
@@ -110,6 +125,7 @@ enum Command {
     },
     CloseSession {
         session_id: String,
+        response: mpsc::Sender<Result<(), String>>,
     },
     EnsureSessionClock {
         session_id: String,
@@ -136,6 +152,7 @@ enum Command {
 }
 
 struct AppSession {
+    application_plan: Option<SessionPlan>,
     ability: String,
     devices: Vec<String>,
     fabric_session_id: Option<SessionId>,
@@ -157,7 +174,12 @@ struct IncomingStreamRequest {
     write_fd: i32,
 }
 
-type RemoteCompletion = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+struct RemoteCompletion {
+    sender: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    peer: DeviceId,
+    expires_at: Instant,
+    application_session: Option<String>,
+}
 
 struct RuntimeHandle {
     commands: tokio::sync::mpsc::Sender<Command>,
@@ -423,7 +445,7 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeSta
     let candidates = Arc::new(Mutex::new(String::new()));
     let sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let completions = Arc::new(Mutex::new(BTreeMap::new()));
-    let (incoming_tx, incoming_rx) = mpsc::channel();
+    let (incoming_tx, incoming_rx) = mpsc::sync_channel(64);
     let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel();
     let (commands, command_rx) = tokio::sync::mpsc::channel(64);
     let thread_status = Arc::clone(&status);
@@ -566,6 +588,14 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativePai
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeReloadTrust(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    command_result(|response| Command::ReloadTrust { response })
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeAccept(
     mut env: JNIEnv,
     _class: JClass,
@@ -670,6 +700,60 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeInv
         }
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeInvokeSession(
+    mut env: JNIEnv,
+    _class: JClass,
+    session: JString,
+    device: JString,
+    ability: JString,
+    payload: JByteArray,
+) -> jbyteArray {
+    let (Ok(session), Ok(device), Ok(ability), Ok(payload)) = (
+        env.get_string(&session),
+        env.get_string(&device),
+        env.get_string(&ability),
+        env.convert_byte_array(&payload),
+    ) else {
+        return std::ptr::null_mut();
+    };
+    let (tx, rx) = mpsc::channel();
+    if !send_command(Command::InvokeSession {
+        session: session.to_string_lossy().into_owned(),
+        device: device.to_string_lossy().into_owned(),
+        ability: ability.to_string_lossy().into_owned(),
+        payload,
+        response: tx,
+    }) {
+        return std::ptr::null_mut();
+    }
+    match rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(Ok(bytes)) => env
+            .byte_array_from_slice(&bytes)
+            .map_or(std::ptr::null_mut(), JByteArray::into_raw),
+        Ok(Err(error)) => {
+            let _ = env.throw_new("java/lang/IllegalStateException", error);
+            std::ptr::null_mut()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeApplicationSessionActive(
+    mut env: JNIEnv,
+    _class: JClass,
+    session: JString,
+) -> jboolean {
+    let Ok(session) = env.get_string(&session) else {
+        return JNI_FALSE;
+    };
+    command_result(|response| Command::ApplicationSessionActive {
+        session: session.to_string_lossy().into_owned(),
+        response,
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -790,6 +874,7 @@ async fn open_audio_network_session(
     device_ids: Vec<String>,
     ability: String,
     config: &[u8],
+    application_offer: Option<AbilityOffer>,
 ) -> Result<String, String> {
     let peers: Vec<String> = device_ids
         .into_iter()
@@ -804,7 +889,35 @@ async fn open_audio_network_session(
         .collect::<Result<Vec<_>, _>>()?;
     let local = links.local_device_id();
     let (delivery, relay_root) = parse_session_config(config, &peers);
-    let plan = build_audio_session_plan(local, &peer_ids, &ability, delivery.as_str())?;
+    let application = application_offer.is_some();
+    let plan = if let Some(offer) = application_offer {
+        let mut offers = vec![(local, offer.clone())];
+        for peer in &peer_ids {
+            if *peer == local
+                || !links
+                    .active_peers()
+                    .await
+                    .iter()
+                    .any(|p| p.device_id == *peer && p.trust == DeviceTrust::Trusted)
+            {
+                return Err("application Session peer is not online and trusted".into());
+            }
+            let remote = links
+                .peer_offers(*peer)
+                .await
+                .into_iter()
+                .find(|candidate| {
+                    candidate.contract == offer.contract
+                        && candidate.roles.iter().any(|role| role.0 == "peer")
+                })
+                .ok_or_else(|| "peer has no matching live application offer".to_owned())?;
+            offers.push((*peer, remote));
+        }
+        build_application_session_plan(offers, config)?
+    } else {
+        build_audio_session_plan(local, &peer_ids, &ability, delivery.as_str())?
+    };
+    let application_plan = application.then(|| plan.clone());
     let fabric_id = links
         .propose_network_session(plan)
         .await
@@ -831,8 +944,10 @@ async fn open_audio_network_session(
     // Clock sync is best effort here: a peer without a mapping still receives
     // metadata and media, it just starts unsynced. `ensureSessionClock` is the
     // caller's strict check when it actually needs a barrier.
-    for peer in &peer_ids {
-        let _ = links.ensure_peer_clock(*peer).await;
+    if !application {
+        for peer in &peer_ids {
+            let _ = links.ensure_peer_clock(*peer).await;
+        }
     }
     let app_id = fabric_id.0.to_string();
     sessions
@@ -841,6 +956,7 @@ async fn open_audio_network_session(
         .insert(
             app_id.clone(),
             AppSession {
+                application_plan,
                 ability,
                 devices: peers,
                 fabric_session_id: Some(fabric_id),
@@ -849,6 +965,153 @@ async fn open_audio_network_session(
             },
         );
     Ok(app_id)
+}
+
+fn build_application_session_plan(
+    offers: Vec<(DeviceId, AbilityOffer)>,
+    config: &[u8],
+) -> Result<SessionPlan, String> {
+    if !(2..=65).contains(&offers.len()) || config.len() > 32_768 {
+        return Err("application Session bounds exceeded".into());
+    }
+    let contract = offers[0].1.contract.clone();
+    let participants = offers
+        .into_iter()
+        .map(|(device_id, offer)| Participant {
+            id: ParticipantId::new(),
+            device_id,
+            app_principal: offer.app,
+            ability_instance: offer.instance_id,
+            role: RoleId::new("peer").expect("constant role"),
+            port_bindings: vec![PortBinding {
+                id: PortId::new(),
+                declaration_id: "control".into(),
+            }],
+        })
+        .collect::<Vec<_>>();
+    let endpoints = participants
+        .iter()
+        .map(|p| PortRef {
+            participant: p.id,
+            port: p.port_bindings[0].id,
+        })
+        .collect::<Vec<_>>();
+    let channels = endpoints
+        .iter()
+        .map(|source| ChannelBinding {
+            id: ChannelId::new(),
+            sources: vec![source.clone()],
+            destinations: endpoints
+                .iter()
+                .filter(|dest| dest.participant != source.participant)
+                .cloned()
+                .collect(),
+            contract: ChannelContract {
+                mode: PortMode::ReliableMessages,
+                delivery: DeliverySemantics::ReliableOrdered,
+                priority: 8,
+                max_message_bytes: Some(512 * 1024),
+                max_buffered_bytes: 2 * 1024 * 1024,
+                latency_target_ms: Some(100),
+                idle_timeout_ms: Some(60_000),
+                fanout: FanoutPolicy::All,
+                payload_security: PayloadSecurity::HubReadable,
+                timing: TimingPolicy::None,
+            },
+        })
+        .collect();
+    let plan = SessionPlan {
+        session_id: SessionId::new(),
+        contract,
+        epoch: 1,
+        coordinator: participants[0].id,
+        participants,
+        channels,
+        extensions: SessionExtensions {
+            clock: None,
+            barrier_enabled: false,
+            opaque_ability_config: config.to_vec(),
+        },
+        policy_snapshot: PolicySnapshotId::new(),
+    };
+    plan.validate().map_err(|error| error.to_string())?;
+    Ok(plan)
+}
+
+async fn application_plan_matches(
+    links: &Arc<LinkServices>,
+    local_offers: &[AbilityOffer],
+    plan: &SessionPlan,
+) -> bool {
+    if plan.validate().is_err()
+        || !(2..=65).contains(&plan.participants.len())
+        || plan.channels.len() != plan.participants.len()
+        || plan.extensions.opaque_ability_config.len() > 32_768
+        || plan.extensions.clock.is_some()
+        || plan.extensions.barrier_enabled
+    {
+        return false;
+    }
+    let mut devices = BTreeSet::new();
+    for participant in &plan.participants {
+        if !devices.insert(participant.device_id)
+            || participant.role.0 != "peer"
+            || participant.port_bindings.len() != 1
+            || participant.port_bindings[0].declaration_id != "control"
+        {
+            return false;
+        }
+        let offers = if participant.device_id == links.local_device_id() {
+            local_offers.to_vec()
+        } else {
+            links.peer_offers(participant.device_id).await
+        };
+        if !offers.iter().any(|offer| {
+            offer.contract == plan.contract
+                && offer.instance_id == participant.ability_instance
+                && offer.app == participant.app_principal
+                && offer.roles.iter().any(|role| role.0 == "peer")
+        }) {
+            return false;
+        }
+        let channels = plan
+            .channels
+            .iter()
+            .filter(|c| c.sources.len() == 1 && c.sources[0].participant == participant.id)
+            .collect::<Vec<_>>();
+        if channels.len() != 1 {
+            return false;
+        }
+        let channel = channels[0];
+        if channel.sources[0].port != participant.port_bindings[0].id
+            || channel.contract.mode != PortMode::ReliableMessages
+            || channel.contract.delivery != DeliverySemantics::ReliableOrdered
+            || channel.contract.max_message_bytes != Some(512 * 1024)
+            || channel.contract.max_buffered_bytes != 2 * 1024 * 1024
+            || channel.contract.payload_security != PayloadSecurity::HubReadable
+            || channel.contract.timing != TimingPolicy::None
+            || channel.contract.fanout != FanoutPolicy::All
+            || channel.destinations.len() + 1 != plan.participants.len()
+        {
+            return false;
+        }
+        let expected = plan
+            .participants
+            .iter()
+            .filter(|p| p.id != participant.id)
+            .map(|p| (p.id, p.port_bindings[0].id))
+            .collect::<BTreeSet<_>>();
+        if channel
+            .destinations
+            .iter()
+            .map(|p| (p.participant, p.port))
+            .collect::<BTreeSet<_>>()
+            != expected
+        {
+            return false;
+        }
+    }
+    devices.contains(&links.local_device_id())
 }
 
 fn parse_session_config(config: &[u8], peers: &[String]) -> (String, Option<String>) {
@@ -1121,9 +1384,23 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeClo
     let Ok(session_id) = env.get_string(&session_id) else {
         return;
     };
-    let _ = send_command(Command::CloseSession {
+    let (tx, rx) = mpsc::channel();
+    if !send_command(Command::CloseSession {
         session_id: session_id.to_string_lossy().into_owned(),
-    });
+        response: tx,
+    }) {
+        return;
+    }
+    match rx.recv_timeout(COMMAND_TIMEOUT) {
+        Ok(Ok(())) => {}
+        result => {
+            let reason = match result {
+                Ok(Err(error)) => error,
+                _ => "Session close timed out".to_owned(),
+            };
+            let _ = env.throw_new("java/lang/IllegalStateException", reason);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1229,6 +1506,61 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeSes
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeRemoteRequestSession(
+    env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jstring {
+    let context = runtime_value(|handle| {
+        let id = handle
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request_id)
+            .filter(|r| Instant::now() < r.expires_at)
+            .and_then(|r| r.application_session.clone())?;
+        let sessions = handle
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = sessions.get(&id)?;
+        let plan = session.application_plan.as_ref()?;
+        let config =
+            serde_json::from_slice::<serde_json::Value>(&plan.extensions.opaque_ability_config)
+                .ok()?;
+        let binding = config.get("binding_b64")?.as_str()?;
+        Some(
+            serde_json::json!({"session_id":id,"ability":session.ability,"binding_b64":binding})
+                .to_string(),
+        )
+    })
+    .flatten();
+    context
+        .and_then(|value| env.new_string(value).ok())
+        .map_or(std::ptr::null_mut(), |value| value.into_raw())
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeRemoteRequestPeer(
+    env: JNIEnv,
+    _class: JClass,
+    request_id: jlong,
+) -> jbyteArray {
+    let peer = runtime_value(|handle| {
+        handle
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request_id)
+            .filter(|request| Instant::now() < request.expires_at)
+            .map(|request| request.peer.0)
+    })
+    .flatten();
+    peer.and_then(|peer| env.byte_array_from_slice(&peer).ok())
+        .map_or(std::ptr::null_mut(), JByteArray::into_raw)
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeCompleteRemote(
     env: JNIEnv,
     _class: JClass,
@@ -1250,7 +1582,12 @@ pub extern "system" fn Java_com_mocharealm_foundation_fabric_NativeHub_nativeCom
     })
     .flatten()
     {
-        let _ = completion.send(result);
+        let result = if Instant::now() >= completion.expires_at {
+            Err("provider timed out".into())
+        } else {
+            result
+        };
+        let _ = completion.sender.send(result);
     }
 }
 
@@ -1293,7 +1630,7 @@ async fn run_hub(
     devices: &Arc<Mutex<String>>,
     candidates: &Arc<Mutex<String>>,
     sessions: &Arc<Mutex<BTreeMap<String, AppSession>>>,
-    incoming: mpsc::Sender<IncomingRequest>,
+    incoming: mpsc::SyncSender<IncomingRequest>,
     incoming_streams: mpsc::Sender<IncomingStreamRequest>,
     completions: Arc<Mutex<BTreeMap<i64, RemoteCompletion>>>,
 ) -> Result<(), String> {
@@ -1358,19 +1695,72 @@ async fn run_hub(
     let dial_hints: Arc<Mutex<DialHints>> = Arc::new(Mutex::new(DialHints::default()));
 
     let incoming_links = Arc::clone(&services.links);
+    let incoming_sessions = Arc::clone(sessions);
     let incoming_completions = Arc::clone(&completions);
     let incoming_registered = Arc::clone(&registered_abilities);
     let incoming_task = tokio::spawn(async move {
         let mut next_request_id = -1_i64;
         while let Some(item) = incoming_links.next_stream().await {
             if let IncomingStream::Bi(header, mut stream) = item.stream
-                && header.e2ee_header.as_ref() == BROKER_STREAM_HEADER
+                && (header.e2ee_header.as_ref() == BROKER_STREAM_HEADER
+                    || header.e2ee_header.as_ref() == APPLICATION_SESSION_HEADER)
             {
                 let Ok(request) = read_remote_request(&mut stream).await else {
                     continue;
                 };
+                let application_session = if header.e2ee_header.as_ref()
+                    == APPLICATION_SESSION_HEADER
+                {
+                    let id = header.session_id.0.to_string();
+                    let plan = incoming_sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&id)
+                        .and_then(|s| s.application_plan.clone());
+                    let request_ability = match &request {
+                        RemoteRequest::Invocation(r) => &r.ability,
+                        RemoteRequest::StreamOpen(r) => &r.ability,
+                    };
+                    let valid = plan.as_ref().is_some_and(|plan| {
+                        format!(
+                            "{}.{}",
+                            plan.contract.key.namespace.as_str(),
+                            plan.contract.key.name.as_str()
+                        ) == *request_ability
+                            && application_header(plan, item.peer, incoming_links.local_device_id())
+                                .is_ok_and(|expected| {
+                                    expected.channel_id == header.channel_id
+                                        && expected.sender == header.sender
+                                        && expected.destination_binding
+                                            == header.destination_binding
+                                        && expected.epoch == header.epoch
+                                })
+                    });
+                    if !valid
+                        || incoming_links
+                            .network_session_state(header.session_id)
+                            .await
+                            != Some(SessionState::Active)
+                        || incoming_links
+                            .network_session_epoch(header.session_id)
+                            .await
+                            != Some(header.epoch)
+                    {
+                        continue;
+                    }
+                    Some(id)
+                } else {
+                    None
+                };
+                if application_session.is_some() && matches!(&request, RemoteRequest::StreamOpen(_))
+                {
+                    continue;
+                }
                 let local_id = next_request_id;
-                next_request_id = next_request_id.checked_sub(1).unwrap_or(-1);
+                let Some(next_id) = next_request_id.checked_sub(1) else {
+                    break;
+                };
+                next_request_id = next_id;
                 let has_provider = incoming_registered
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1408,20 +1798,73 @@ async fn run_hub(
                 match request {
                     RemoteRequest::Invocation(request) => {
                         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-                        incoming_completions
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(local_id, completion_tx);
-                        if incoming
-                            .send(IncomingRequest {
-                                request_id: local_id,
-                                ability: request.ability,
-                                payload: request.payload,
-                            })
-                            .is_err()
-                        {
-                            break;
+                        let admitted = {
+                            let mut pending = incoming_completions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if pending.len() >= 128
+                                || pending
+                                    .values()
+                                    .filter(|entry| entry.peer == item.peer)
+                                    .count()
+                                    >= 16
+                            {
+                                false
+                            } else {
+                                pending.insert(
+                                    local_id,
+                                    RemoteCompletion {
+                                        sender: completion_tx,
+                                        peer: item.peer,
+                                        expires_at: Instant::now() + Duration::from_secs(10),
+                                        application_session,
+                                    },
+                                );
+                                true
+                            }
+                        };
+                        if !admitted {
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(250),
+                                write_remote_result(
+                                    &mut stream,
+                                    request.request_id,
+                                    Err("provider is busy".into()),
+                                ),
+                            )
+                            .await;
+                            continue;
                         }
+                        if let Err(error) = incoming.try_send(IncomingRequest {
+                            request_id: local_id,
+                            ability: request.ability,
+                            payload: request.payload,
+                        }) {
+                            incoming_completions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&local_id);
+                            let disconnected = matches!(error, mpsc::TrySendError::Disconnected(_));
+                            let failure = if disconnected {
+                                "ability provider is unavailable"
+                            } else {
+                                "provider is busy"
+                            };
+                            let _ = tokio::time::timeout(
+                                Duration::from_millis(250),
+                                write_remote_result(
+                                    &mut stream,
+                                    request.request_id,
+                                    Err(failure.into()),
+                                ),
+                            )
+                            .await;
+                            if disconnected {
+                                break;
+                            }
+                            continue;
+                        }
+                        let request_completions = Arc::clone(&incoming_completions);
                         tokio::spawn(async move {
                             let result =
                                 match tokio::time::timeout(Duration::from_secs(10), completion_rx)
@@ -1430,6 +1873,10 @@ async fn run_hub(
                                     Ok(Ok(result)) => result,
                                     _ => Err("provider timed out".into()),
                                 };
+                            request_completions
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&local_id);
                             let _ =
                                 write_remote_result(&mut stream, request.request_id, result).await;
                         });
@@ -1509,6 +1956,18 @@ async fn run_hub(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .remove(&ability);
+                        let removed = {
+                            let mut all = sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let ids = all.iter().filter(|(_, s)| s.ability == ability && s.application_plan.is_some()).map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                            ids.into_iter().filter_map(|id| all.remove(&id).and_then(|s| s.fabric_session_id)).collect::<Vec<_>>()
+                        };
+                        for id in removed {
+                            let links = Arc::clone(&services.links);
+                            let status = Arc::clone(status);
+                            tokio::spawn(async move { if let Err(error) = links.close_network_session(id, "application provider removed").await {
+                                set_status(&status, format!("Session close failed: {error}"));
+                            } });
+                        }
                     }
                 }
                 Some(Command::Pair { address, response }) => {
@@ -1539,6 +1998,9 @@ async fn run_hub(
                     let result =
                         accept_device(&services.links, &trust, &device_label, &device).await;
                     let _ = response.send(result);
+                }
+                Some(Command::ReloadTrust { response }) => {
+                    let _ = response.send(trust.reload().map_err(|error| error.to_string()));
                 }
                 Some(Command::Remove { device, response }) => {
                     let result = remove_device(&services.links, &trust, &labels, &mut addresses, &device).await
@@ -1584,6 +2046,17 @@ async fn run_hub(
                     });
                 }
                 Some(Command::OpenSession { device_ids, ability, config, response }) => {
+                    let application = serde_json::from_slice::<serde_json::Value>(&config).ok()
+                        .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("application"));
+                    let application_offer = if let Some(settings) = application {
+                        let package = settings.get("package").and_then(|v| v.as_str()).unwrap_or("");
+                        let uid = settings.get("uid").and_then(|v| v.as_i64()).unwrap_or(-1);
+                        let offer = hub.registry().snapshot().map_err(|error| error.to_string())?.offers.into_iter().find(|offer|
+                            format!("{}.{}", offer.contract.key.namespace.as_str(), offer.contract.key.name.as_str()) == ability &&
+                            offer.app.stable_app_id == package && offer.app.os_subject.0 == format!("android:uid:{uid}"));
+                        let Some(offer) = offer else { let _ = response.send(Err("live provider offer required".into())); continue; };
+                        Some(offer)
+                    } else { None };
                     let links = Arc::clone(&services.links);
                     let sessions = Arc::clone(sessions);
                     tokio::spawn(async move {
@@ -1593,20 +2066,42 @@ async fn run_hub(
                             device_ids,
                             ability,
                             &config,
+                            application_offer,
                         )
                         .await;
+                        if let Err(std::sync::mpsc::SendError(Ok(id))) = response.send(result) {
+                            let session = sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id);
+                            if let Some(id) = session.and_then(|s| s.fabric_session_id) { let _ = links.close_network_session(id, "Session opener disappeared").await; }
+                        }
+                    });
+                }
+                Some(Command::ApplicationSessionActive { session, response }) => {
+                    let binding = sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&session).and_then(|s| s.application_plan.as_ref().map(|plan| (plan.session_id, plan.epoch)));
+                    let result = if let Some((id, epoch)) = binding {
+                        if services.links.network_session_state(id).await == Some(SessionState::Active) &&
+                            services.links.network_session_epoch(id).await == Some(epoch) { Ok(()) }
+                        else { Err("application Session is not active".into()) }
+                    } else { Err("application Session is closed".into()) };
+                    let _ = response.send(result);
+                }
+                Some(Command::InvokeSession { session, device, ability, payload, response }) => {
+                    let links = Arc::clone(&services.links); let trust = Arc::clone(&trust); let sessions = Arc::clone(sessions);
+                    tokio::spawn(async move {
+                        let result = invoke_application_session(&links, &trust, &sessions, &session, &device, &ability, payload).await;
                         let _ = response.send(result);
                     });
                 }
-                Some(Command::CloseSession { session_id }) => {
+                Some(Command::CloseSession { session_id, response }) => {
                     let fabric_id = sessions
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .remove(&session_id)
                         .and_then(|session| session.fabric_session_id);
                     if let Some(fabric_id) = fabric_id {
-                        services.links.remove_session(fabric_id).await;
-                    }
+                        let links = Arc::clone(&services.links);
+                        tokio::spawn(async move { let _ = response.send(links.close_network_session(fabric_id, "application closed Session").await); });
+                    } else { let _ = response.send(Ok(())); }
                 }
                 Some(Command::EnsureSessionClock { session_id, response }) => {
                     let peers = sessions
@@ -1683,6 +2178,10 @@ async fn run_hub(
             control = services.links.next_control() => {
                 if let Some(control) = control {
                     match control.message {
+                        ControlMessage::SessionClose(close) => {
+                            sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&close.header.session_id.0.to_string());
+                        }
                         ControlMessage::PairingStart(start) => {
                             labels
                                 .set_label(control.peer, &start.device_label)
@@ -1706,7 +2205,18 @@ async fn run_hub(
                             }
                         }
                         ControlMessage::SessionPropose(propose) => {
-                            // Auto-accept audio (and any) network sessions for trusted peers.
+                            let proposed = serde_json::from_slice::<SessionPlan>(&propose.encoded_draft_plan).ok();
+                            let application = proposed.as_ref().is_some_and(|plan|
+                                serde_json::from_slice::<serde_json::Value>(&plan.extensions.opaque_ability_config).ok()
+                                    .is_some_and(|v| v.get("kind").and_then(|k| k.as_str()) == Some("application")));
+                            if application {
+                                let local_offers = hub.registry().snapshot().map_err(|error| error.to_string())?.offers;
+                                if control.trust != DeviceTrust::Trusted ||
+                                    !application_plan_matches(&services.links, &local_offers, proposed.as_ref().expect("parsed application plan")).await {
+                                    services.links.remove_session(propose.header.session_id).await;
+                                    continue;
+                                }
+                            }
                             let sid = propose.header.session_id;
                             if services.links.accept_network_session(sid).await.is_ok() {
                                 let app_id = sid.0.to_string();
@@ -1738,6 +2248,7 @@ async fn run_hub(
                                     .insert(
                                         app_id,
                                         AppSession {
+                                            application_plan: if application { proposed } else { None },
                                             ability: ability_name,
                                             devices: peers,
                                             fabric_session_id: Some(sid),
@@ -2160,6 +2671,104 @@ async fn persist_authenticated_direct_addresses(
     Ok(())
 }
 
+fn application_header(
+    plan: &SessionPlan,
+    source: DeviceId,
+    destination: DeviceId,
+) -> Result<StreamOpen, String> {
+    let from = plan
+        .participants
+        .iter()
+        .find(|p| p.device_id == source)
+        .ok_or("source not in Session")?;
+    let to = plan
+        .participants
+        .iter()
+        .find(|p| p.device_id == destination)
+        .ok_or("destination not in Session")?;
+    let channel = plan
+        .channels
+        .iter()
+        .find(|channel| {
+            channel.contract.mode == PortMode::ReliableMessages
+                && channel.sources.iter().any(|p| p.participant == from.id)
+                && channel.destinations.iter().any(|p| p.participant == to.id)
+        })
+        .ok_or("Session has no reliable message channel for this pair")?;
+    let target = channel
+        .destinations
+        .iter()
+        .find(|p| p.participant == to.id)
+        .ok_or("missing destination binding")?;
+    Ok(StreamOpen {
+        session_id: plan.session_id,
+        epoch: plan.epoch,
+        channel_id: channel.id,
+        sender: from.id,
+        destination_binding: *target.port.0.as_bytes(),
+        flags: 0,
+        e2ee_header: Bytes::from_static(APPLICATION_SESSION_HEADER),
+    })
+}
+
+async fn invoke_application_session(
+    links: &Arc<LinkServices>,
+    trust: &Arc<FileDeviceTrustStore>,
+    sessions: &Arc<Mutex<BTreeMap<String, AppSession>>>,
+    id: &str,
+    encoded: &str,
+    ability: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let peer = decode_device_id(encoded).map_err(|error| error.to_string())?;
+    if trust.trust(peer).map_err(|error| error.to_string())? != DeviceTrust::Trusted {
+        return Err("device is not trusted".into());
+    }
+    let plan = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .filter(|s| s.ability == ability)
+        .and_then(|s| s.application_plan.clone())
+        .ok_or("provider Session is closed")?;
+    if payload.is_empty()
+        || payload.len() > 512 * 1024
+        || links.network_session_state(plan.session_id).await != Some(SessionState::Active)
+        || links.network_session_epoch(plan.session_id).await != Some(plan.epoch)
+    {
+        return Err("application Session is unavailable".into());
+    }
+    let header = application_header(&plan, links.local_device_id(), peer)?;
+    let link = links
+        .link(peer)
+        .await
+        .ok_or("application Session peer disconnected")?;
+    let mut stream = link
+        .open_bi(header)
+        .await
+        .map_err(|error| error.to_string())?;
+    let value = invoke_remote_stream(&mut stream, 1, ability, payload)
+        .await
+        .map_err(|error| error.to_string())?;
+    let still_present = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(id)
+        .is_some_and(|s| {
+            s.application_plan
+                .as_ref()
+                .is_some_and(|p| p.session_id == plan.session_id && p.epoch == plan.epoch)
+        });
+    if !still_present
+        || links.network_session_state(plan.session_id).await != Some(SessionState::Active)
+        || links.network_session_epoch(plan.session_id).await != Some(plan.epoch)
+        || trust.trust(peer).map_err(|error| error.to_string())? != DeviceTrust::Trusted
+    {
+        return Err("application Session changed before completion".into());
+    }
+    Ok(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn invoke_remote(
     links: &Arc<LinkServices>,
@@ -2506,6 +3115,13 @@ fn register_offer(
     let (namespace, name) = ability
         .rsplit_once('.')
         .ok_or_else(|| "ability must contain a namespace".to_string())?;
+    // Validate before reserving an IPC connection: malformed contracts must
+    // not leak connection quota when offer construction returns early.
+    let ability_key = AbilityKey {
+        namespace: Namespace::new(namespace).map_err(|error| error.to_string())?,
+        name: AbilityName::new(name).map_err(|error| error.to_string())?,
+        major: 1,
+    };
     let credentials = PeerCredentials {
         platform: Platform::Android,
         stable_app_id: package.into(),
@@ -2520,11 +3136,7 @@ fn register_offer(
     let offer = AbilityOffer {
         instance_id: AbilityInstanceId::new(),
         contract: AbilityContractRef {
-            key: AbilityKey {
-                namespace: Namespace::new(namespace).map_err(|error| error.to_string())?,
-                name: AbilityName::new(name).map_err(|error| error.to_string())?,
-                major: 1,
-            },
+            key: ability_key,
             protocol_hash,
         },
         app: principal,
@@ -2616,6 +3228,17 @@ fn local_candidates(quic_port: u16) -> Vec<SocketAddr> {
 }
 
 fn load_or_create_seed(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err("device key must be a regular private file".into());
+            }
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+
     match OpenOptions::new().read(true).open(path) {
         Ok(mut file) => {
             let mut seed = [0; 32];
@@ -2628,7 +3251,14 @@ fn load_or_create_seed(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Erro
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let seed = DeviceIdentity::generate().seed_for_secure_storage();
-            let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
             file.write_all(&seed)?;
             file.sync_all()?;
             Ok(seed)

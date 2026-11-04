@@ -1,9 +1,10 @@
 """Compile production phone proof validation with OpenSSL-backed HMAC adapter."""
+from host_support import PROJECT_ROOT, SDK_ROOT, CC
 from pathlib import Path
 import subprocess, tempfile, hmac, hashlib
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 wire = (root/'app/buffer_app/buffer_wire.c').read_text()
-cjson = root.parent/'apps/netutils/cjson/cJSON'
+cjson = SDK_ROOT / 'apps/netutils/cjson/cJSON'
 def section(start,end):
     a=wire.index(start)
     return wire[a:wire.index(end,a)]
@@ -56,5 +57,5 @@ int main(void) {{
 with tempfile.TemporaryDirectory(prefix='buffer-phone-auth-') as tmp:
     work=Path(tmp)
     (work/'test.c').write_text(harness)
-    subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(cjson),str(work/'test.c'),str(cjson/'cJSON.c'),'-lcrypto','-lm','-o',str(work/'test')],check=True)
+    subprocess.run([*CC,'-Wall','-Wextra','-Werror','-I',str(cjson),str(work/'test.c'),str(cjson/'cJSON.c'),'-lcrypto','-lm','-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],check=True)

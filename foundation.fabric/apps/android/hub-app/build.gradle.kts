@@ -32,6 +32,7 @@ android {
 
 dependencies {
     implementation(project(":fabric-sdk"))
+    implementation(files(rootProject.layout.projectDirectory.file("../../platform/android/build/outputs/aar/fabric-ble-android-debug.aar")))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))

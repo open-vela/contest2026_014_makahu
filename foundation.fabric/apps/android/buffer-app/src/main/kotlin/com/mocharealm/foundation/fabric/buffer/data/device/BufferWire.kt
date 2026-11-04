@@ -17,6 +17,65 @@ import org.json.JSONObject
  * QUIC.
  */
 object BufferWire {
+    /** Fabric origin comes from the selected-provider IPC context, never the
+     * JSON body. Local calls retain this application's own source identity. */
+    fun handleAuthenticated(repository: BufferRepository, request: JSONObject,
+                            authenticatedDevice: String, localDevice: String, sessionContext: String? = null): JSONObject {
+        val identity = Regex("[0-9a-f]{64}")
+        require(identity.matches(authenticatedDevice) && identity.matches(localDevice))
+        val local = authenticatedDevice == localDevice
+        if (request.has("device_id") && !request.isNull("device_id")) {
+            val claimed = request.get("device_id")
+            require(claimed is String && (claimed == authenticatedDevice || (local && claimed == repository.deviceId()))) {
+                "device identity does not match authenticated invocation"
+            }
+        }
+        if (request.optString("type") == "buffer.mesh.hello") {
+            require(!local) { "member discovery requires a remote device" }
+            repository.observeMeshMember(authenticatedDevice, localDevice, request)
+            return repository.meshHello(localDevice, reply = true)
+        }
+        val meshType = request.optString("type")
+        if (!local && meshType in setOf("buffer.mesh.job", "buffer.mesh.input", "buffer.mesh.facts"))
+            repository.requireMeshInvocationSession(authenticatedDevice, localDevice, request, sessionContext)
+        if (meshType == "buffer.mesh.facts") {
+            require(!local)
+            return repository.exchangeMeshFacts(authenticatedDevice, localDevice, request)
+        }
+        if (meshType == "buffer.mesh.cancel") {
+            require(!local)
+            return repository.exchangeMeshCancellation(authenticatedDevice, localDevice, request)
+        }
+        if (meshType == "buffer.mesh.input") {
+            require(!local)
+            return repository.exchangeMeshTaskInput(authenticatedDevice, localDevice, request)
+        }
+        if (meshType == "buffer.mesh.job") {
+            require(!local)
+            return repository.exchangeMeshTask(authenticatedDevice, localDevice, request)
+        }
+        if (meshType == "buffer.mesh.heartbeat") {
+            require(!local)
+            return repository.exchangeMeshCoordinator(authenticatedDevice, localDevice, request)
+        }
+        if (meshType in setOf("buffer.mesh.binding.get", "buffer.mesh.binding.check")) {
+            val checking = meshType == "buffer.mesh.binding.check"
+            val expected = setOf("type", "protocol", "device_id") + (if (checking) setOf("digest", "revision") else emptySet())
+            require(request.keys().asSequence().toSet() == expected)
+            require(request.get("protocol") == 1)
+            return repository.withApprovedMeshMember(authenticatedDevice, localDevice) {
+                if (checking) repository.meshBinding(localDevice, request.getString("digest"), request.getString("revision"))
+                else repository.meshBinding(localDevice)
+            }
+        }
+        val bound = JSONObject(request.toString()).put("device_id", if (local) repository.deviceId() else authenticatedDevice)
+        val response = if (local || request.optString("type") in setOf("hello", "ping")) handle(repository, bound)
+            else repository.withApprovedMeshMember(authenticatedDevice, localDevice) { handle(repository, bound) }
+        return response.also {
+            if (it.optString("type") == "hello_ack") it.put("device_id", localDevice)
+        }
+    }
+
     fun handle(repository: BufferRepository, request: JSONObject): JSONObject {
         return try {
             when (request.optString("type")) {
@@ -134,7 +193,9 @@ object BufferWire {
         val research = repository.rabbitSnapshot(System.currentTimeMillis())
         val selectedMode = repository.mode()
         val array = JSONArray()
-        repository.cardsForMode(selectedMode).forEach { card -> array.put(card.toJson()) }
+        repository.cardsForMode(selectedMode).forEach { card ->
+            array.put(repository.displayCardJson(card))
+        }
         JSONObject()
             .put("type", "display_cards.updated")
             .put("protocol", BufferConstants.protocolVersion)
@@ -172,5 +233,5 @@ fun BufferCard.toJson(): JSONObject = JSONObject()
     // (answers, calendar/health writes, classification, and Spark derivation)
     // stay in the Android card view.
     .put("actions", JSONArray(actions.filter {
-        it in setOf("later", "done", "archive", "remind", "rabbit_hole")
+        it in setOf("later", "done", "reopen", "archive", "remind", "rabbit_hole")
     }))

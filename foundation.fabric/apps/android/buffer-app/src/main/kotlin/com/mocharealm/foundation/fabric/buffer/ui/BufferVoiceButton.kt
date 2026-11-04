@@ -59,7 +59,7 @@ internal fun VoiceButton(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Icon(BufferIcons.Mic, null, tint = if (recording) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary)
-            Text(if (recording) "松开，收好这段声音" else "按住，说点什么",
+            Text(if (recording) "松开保存" else "按住录音",
                 color = if (recording) MaterialTheme.colorScheme.onError else MaterialTheme.colorScheme.onPrimary,
                 style = MaterialTheme.typography.titleMedium)
         }

@@ -35,7 +35,15 @@ internal object ClassificationReview {
 
     /** Adds new review choices to existing persisted proposals without a migration. */
     fun normalizeActions(card: BufferCard): BufferCard {
-        val base = card.actions.filterNot { it in reviewActions || (it == "health_sync" && card.healthCategory !in LifeLogCategories.exportable) }
+        val base = card.actions.filterNot {
+            it in reviewActions || (it == "health_sync" && card.healthCategory !in LifeLogCategories.exportable) ||
+                (it == "reopen" && (card.kind != "task_card" || card.state in setOf("archived", "deleted")))
+        }.map {
+            if (card.kind != "task_card") it
+            else if (card.state == "done" && it == "done") "reopen"
+            else if (card.state != "done" && it == "reopen") "done"
+            else it
+        }
         val actions = when {
             card.classificationConfirmed || card.state == "pending_transcription" -> base
             card.kind == UNCLASSIFIED -> base + "edit_classification"

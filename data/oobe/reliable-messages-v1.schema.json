@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vela.buffer.local/protocol/oobe-reliable-messages-v1.schema.json",
+  "title": "Vela app-owned OOBE ReliableMessages v1",
+  "description": "Payload contract only. Fabric owns discovery, peer identity, session authorization and reliable message delivery.",
+  "oneOf": [
+    { "$ref": "#/$defs/statusRequest" },
+    { "$ref": "#/$defs/networkRequest" },
+    { "$ref": "#/$defs/agentRequest" },
+    { "$ref": "#/$defs/skipRequest" },
+    { "$ref": "#/$defs/reply" }
+  ],
+  "$defs": {
+    "requestId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "requestBase": {
+      "type": "object",
+      "required": ["type", "protocol", "request_id", "revision", "operation", "payload"],
+      "properties": {
+        "type": { "const": "vela.oobe.request" },
+        "protocol": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "operation": { "type": "string" },
+        "payload": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "statusRequest": {
+      "allOf": [ { "$ref": "#/$defs/requestBase" } ],
+      "properties": { "operation": { "const": "oobe.status" }, "payload": { "type": "object", "maxProperties": 0 } }
+    },
+    "networkRequest": {
+      "allOf": [ { "$ref": "#/$defs/requestBase" } ],
+      "properties": {
+        "operation": { "const": "network.configure" },
+        "payload": {
+          "type": "object",
+          "required": ["ssid", "password"],
+          "properties": {
+            "ssid": { "type": "string", "minLength": 1, "maxLength": 32 },
+            "password": { "type": "string", "minLength": 8, "maxLength": 64 }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "agentRequest": {
+      "allOf": [ { "$ref": "#/$defs/requestBase" } ],
+      "properties": {
+        "operation": { "const": "agent.configure" },
+        "payload": {
+          "type": "object",
+          "required": ["base_url", "completion_model", "transcription_model", "api_key", "time_zone", "language"],
+          "properties": {
+            "base_url": { "type": "string", "pattern": "^https://", "maxLength": 256 },
+            "completion_model": { "type": "string", "minLength": 1, "maxLength": 200 },
+            "transcription_model": { "const": "mimo-v2.5-asr" },
+            "api_key": { "type": "string", "maxLength": 8192 },
+            "time_zone": { "type": "string", "minLength": 1, "maxLength": 80 },
+            "language": { "type": "string", "minLength": 1, "maxLength": 40 }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "skipRequest": {
+      "allOf": [ { "$ref": "#/$defs/requestBase" } ],
+      "properties": { "operation": { "const": "agent.skip" }, "payload": { "type": "object", "maxProperties": 0 } }
+    },
+    "reply": {
+      "type": "object",
+      "required": ["type", "protocol", "request_id", "revision", "state"],
+      "properties": {
+        "type": { "const": "vela.oobe.reply" },
+        "protocol": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "revision": { "$ref": "#/$defs/revision" },
+        "state": { "enum": ["unpaired", "authenticating", "network_pending", "network_ready", "agent_pending", "agent_saved", "validating", "ready", "skipped", "failed"] },
+        "error_code": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+        "capabilities": {
+          "type": "object",
+          "maxProperties": 12,
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_]{0,39}$" },
+          "additionalProperties": { "type": "boolean" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,10 +1,11 @@
 """Production pairing service must answer UDP while its TCP handler is busy."""
+from host_support import PROJECT_ROOT, SDK_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root / 'app/buffer_app/buffer_pairing.c').read_text()
-cjson = root.parent / 'apps/netutils/cjson/cJSON'
+cjson = SDK_ROOT / 'apps/netutils/cjson/cJSON'
 def extract(start, end):
     return source[source.index(start):source.index(end, source.index(start))]
 harness = r'''
@@ -121,6 +122,6 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix='buffer-pairing-concurrency-') as temporary:
     work = Path(temporary)
     (work / 'test.c').write_text(harness)
-    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(cjson),
+    subprocess.run([*CC, '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(cjson),
                     str(work/'test.c'), str(cjson/'cJSON.c'), '-lm', '-o', str(work/'test')], check=True)
     subprocess.run([str(work/'test')], check=True, timeout=12)

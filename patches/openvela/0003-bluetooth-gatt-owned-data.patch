@@ -1,0 +1,52 @@
+diff --git a/service/stacks/zephyr/sal_gatt_server_interface.c b/service/stacks/zephyr/sal_gatt_server_interface.c
+index 5146fd50..f7f9a821 100644
+--- a/service/stacks/zephyr/sal_gatt_server_interface.c
++++ b/service/stacks/zephyr/sal_gatt_server_interface.c
+@@ -183,6 +183,7 @@ static size_t svc_attr_count;
+ 
+ static struct bt_gatt_service server_svcs[CONFIG_GATT_SERVER_MAX_SERVICES];
+ static struct bt_gatt_attr server_db[CONFIG_GATT_SERVER_MAX_ATTRIBUTES];
++static bool server_data_owned[CONFIG_GATT_SERVER_MAX_ATTRIBUTES];
+ static sal_gatt_sdp_record_t gatt_sdp_records[CONFIG_GATT_SERVER_MAX_SERVICES];
+ 
+ static int find_free_service_index(void)
+@@ -219,16 +220,21 @@ static void remove_from_server_db(const struct bt_gatt_attr* start, size_t count
+     }
+ 
+     for (i = 0; i < count; i++) {
+-        free(start[i].user_data);
++        if (server_data_owned[index + i]) {
++            free(start[i].user_data);
++        }
+         free((void*)start[i].uuid);
+     }
+ 
+     if (index + count < attr_count) {
+         memmove(&server_db[index], &server_db[index + count],
+             (attr_count - index - count) * sizeof(struct bt_gatt_attr));
++        memmove(&server_data_owned[index], &server_data_owned[index + count],
++            (attr_count - index - count) * sizeof(bool));
+     }
+ 
+     memset(&server_db[attr_count - count], 0, count * sizeof(struct bt_gatt_attr));
++    memset(&server_data_owned[attr_count - count], 0, count * sizeof(bool));
+     attr_count -= count;
+ }
+ 
+@@ -366,6 +372,8 @@ static struct bt_gatt_attr* gatt_db_add(const struct bt_gatt_attr* pattern, size
+ 
+     BT_LOGD("user_data 0x%p, user_data_len: %zu", attr->user_data, user_data_len);
+ 
++    /* Zero-length data is borrowed, except for explicitly transferred CCCs. */
++    server_data_owned[attr_count] = user_data_len != 0;
+     attr_count++;
+     svc_attr_count++;
+ 
+@@ -860,6 +868,7 @@ static int alloc_descriptor(const struct bt_gatt_attr* attr, struct add_descript
+             return -EINVAL;
+         }
+ 
++        server_data_owned[attr_desc - server_db] = true;
+         desc->desc_id = attr_desc->handle;
+     } else {
+         user_data.element = desc->element;

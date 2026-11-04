@@ -1,0 +1,169 @@
+--- a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c
++++ b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c
+@@ -104,9 +104,11 @@
+     return is_cf_supported;
+ }
+ 
+-static bool _g2d_draw_img_supported(const lv_draw_image_dsc_t * draw_dsc, int32_t size)
+-{
+-    const lv_image_dsc_t * img_dsc = draw_dsc->src;
++static bool _g2d_draw_img_supported(const lv_draw_image_dsc_t * draw_dsc, int32_t size,
++                                    lv_color_format_t src_cf)
++{
++
++    if(src_cf == LV_COLOR_FORMAT_RGB888) return false;
+ 
+     bool has_recolor = (draw_dsc->recolor_opa != LV_OPA_TRANSP);
+     bool has_transform = (draw_dsc->rotation != 0 || draw_dsc->scale_x != LV_SCALE_NONE ||
+@@ -117,7 +119,7 @@
+         return false;
+ 
+     bool has_opa = (draw_dsc->opa < (lv_opa_t)LV_OPA_MAX);
+-    bool src_has_alpha = (img_dsc->header.cf == LV_COLOR_FORMAT_ARGB8888);
++    bool src_has_alpha = (src_cf == LV_COLOR_FORMAT_ARGB8888);
+ 
+     /*
+      * Recolor or transformation for images w/ opa or alpha channel can't
+@@ -158,6 +160,12 @@
+ static int32_t _g2d_evaluate(lv_draw_unit_t * u, lv_draw_task_t * t)
+ {
+     LV_UNUSED(u);
++    /* G2D width encodes pitch in whole pixels. A 16-byte-aligned RGB888
++     * row can end inside a pixel, so let software render these image tasks. */
++    if((t->type == LV_DRAW_TASK_TYPE_IMAGE || t->type == LV_DRAW_TASK_TYPE_LAYER) &&
++       t->draw_dsc && ((lv_draw_dsc_base_t *)t->draw_dsc)->layer &&
++       ((lv_draw_dsc_base_t *)t->draw_dsc)->layer->color_format == LV_COLOR_FORMAT_RGB888)
++        return 0;
+     lv_area_t img_area;
+     int32_t size = _lv_area_intersect(&img_area, &t->area, &t->clip_area) ?
+                    lv_area_get_width(&img_area) * lv_area_get_height(&img_area) : 0;
+@@ -203,7 +211,7 @@
+                     if(!_g2d_cf_supported(layer_to_draw->color_format))
+                         return 0;
+ 
+-                    if(!_g2d_draw_img_supported(draw_dsc, size))
++                    if(!_g2d_draw_img_supported(draw_dsc, size, layer_to_draw->color_format))
+                         return 0;
+                 }
+                 if(t->preference_score > 70) {
+@@ -224,7 +232,7 @@
+                     if(!_g2d_cf_supported(img_dsc->header.cf))
+                         return 0;
+ 
+-                    if(!_g2d_draw_img_supported(img_dsc, size))
++                    if(!_g2d_draw_img_supported(img_dsc, size, img_dsc->header.cf))
+                         return 0;
+                 }
+ 
+--- a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c
++++ b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_img.c
+@@ -178,7 +178,6 @@
+     lv_area_t src_area_clip, dest_area_clip;
+     lv_area_copy(&src_area_clip, src_area);
+     lv_area_copy(&dest_area_clip, dest_area);
+-    int32_t src_h = lv_area_get_height(&src_area_clip);
+ 
+     bool has_scale = (dsc->scale_x != LV_SCALE_NONE) || (dsc->scale_y != LV_SCALE_NONE);
+     if(has_scale) {
+@@ -203,8 +202,9 @@
+     info.src_image_h.clip_rect.y = src_area_clip.y1;
+     info.src_image_h.clip_rect.w = src_clip_w;
+     info.src_image_h.clip_rect.h = src_clip_h;
+-    info.src_image_h.width = (yuv_buf &&
+-                              yuv_buf->semi_planar.y.stride != 0) ? yuv_buf->semi_planar.y.stride : src_buf->header.w;
++    info.src_image_h.width = yuv_buf ?
++        (yuv_buf->semi_planar.y.stride ? yuv_buf->semi_planar.y.stride : src_buf->header.w) :
++        src_stride / src_px_size;
+     info.src_image_h.height = src_buf->header.h;
+     info.src_image_h.mode = G2D_PIXEL_ALPHA;
+     info.src_image_h.alpha = 255;
+@@ -222,7 +222,7 @@
+     info.dst_image_h.clip_rect.y = dest_area_clip.y1;
+     info.dst_image_h.clip_rect.w = dest_w;
+     info.dst_image_h.clip_rect.h = dest_h;
+-    info.dst_image_h.width = dest_buf->header.w;
++    info.dst_image_h.width = dest_stride / dest_px_size;
+     info.dst_image_h.height = dest_buf->header.h;
+     info.dst_image_h.mode = G2D_PIXEL_ALPHA;
+     info.dst_image_h.alpha = 255;
+@@ -237,18 +237,18 @@
+ 
+     unsigned long dest_vaddr_start = (unsigned long)dest_buf->data + dest_stride * dest_area_clip.y1 + dest_px_size *
+                                      dest_area_clip.x1;
+-    hal_dcache_clean_invalidate(dest_vaddr_start, dest_stride * dest_h);
++    hal_dcache_clean_invalidate(dest_vaddr_start, dest_stride * (dest_h - 1) + dest_w * dest_px_size);
+ 
+     if(LV_COLOR_FORMAT_IS_NV(src_cf)) {
+         unsigned long src_y_vaddr_start = (unsigned long)yuv_buf->semi_planar.y.buf;
+         unsigned long src_uv_vaddr_start = (unsigned long)yuv_buf->semi_planar.uv.buf;
+-        hal_dcache_clean_invalidate(src_y_vaddr_start, yuv_buf->semi_planar.y.stride * src_h);
+-        hal_dcache_clean_invalidate(src_uv_vaddr_start, yuv_buf->semi_planar.uv.stride * src_h);
++        hal_dcache_clean_invalidate(src_y_vaddr_start, yuv_buf->semi_planar.y.stride * src_buf->header.h);
++        hal_dcache_clean_invalidate(src_uv_vaddr_start, yuv_buf->semi_planar.uv.stride * ((src_buf->header.h + 1) / 2));
+     }
+     else {
+         unsigned long src_vaddr_start = (unsigned long)src_buf->data + src_stride * src_area_clip.y1 + src_px_size *
+                                         src_area_clip.x1;
+-        hal_dcache_clean_invalidate(src_vaddr_start, src_stride * src_h);
++        hal_dcache_clean_invalidate(src_vaddr_start, src_stride * (src_clip_h - 1) + src_clip_w * src_px_size);
+     }
+ 
+     if(sunxi_g2d_control(G2D_CMD_BITBLT_H, &info) < 0) {
+@@ -299,7 +299,7 @@
+         info.src_image_h.clip_rect.y = 0;
+         info.src_image_h.clip_rect.w = src_w;
+         info.src_image_h.clip_rect.h = src_h;
+-        info.src_image_h.width = src_buf->header.w;
++        info.src_image_h.width = src_stride / src_px_size;
+         info.src_image_h.height = src_h;
+         info.src_image_h.mode = G2D_PIXEL_ALPHA;
+         info.src_image_h.alpha = 255;
+@@ -317,7 +317,7 @@
+         info.dst_image_h.clip_rect.y = 0;
+         info.dst_image_h.clip_rect.w = zoom_w;
+         info.dst_image_h.clip_rect.h = zoom_h;
+-        info.dst_image_h.width = zoom_w;
++        info.dst_image_h.width = scale_buf->header.stride / src_px_size;
+         info.dst_image_h.height = zoom_h;
+         info.dst_image_h.mode = G2D_PIXEL_ALPHA;
+         info.dst_image_h.alpha = 255;
+@@ -333,8 +333,8 @@
+         unsigned long src_vaddr_start = (unsigned long)src_buf->data;
+         unsigned long dest_vaddr_start = (unsigned long)scale_buf->data;
+ 
+-        hal_dcache_clean_invalidate(src_vaddr_start, src_stride * src_h);
+-        hal_dcache_clean_invalidate(dest_vaddr_start, zoom_w * zoom_h * src_px_size);
++        hal_dcache_clean_invalidate(src_vaddr_start, src_stride * (src_h - 1) + src_w * src_px_size);
++        hal_dcache_clean_invalidate(dest_vaddr_start, scale_buf->header.stride * zoom_h);
+         if(sunxi_g2d_control(G2D_CMD_BITBLT_H, &info) < 0) {
+             LV_LOG_WARN("Error: sunxifb_g2d_blit G2D_CMD_BITBLT_H failed/n");
+             LV_LOG_WARN(
+@@ -395,8 +395,8 @@
+     unsigned long dest_vaddr_start = (unsigned long)dest_buf->data + dest_stride * dest_area->y1 + dest_px_size *
+                                      dest_area->x1;
+ 
+-    hal_dcache_clean_invalidate(src_vaddr_start, src_stride * src_h);
+-    hal_dcache_clean_invalidate(dest_vaddr_start, dest_stride * dest_h);
++    hal_dcache_clean_invalidate(src_vaddr_start, src_stride * (src_h - 1) + src_w * src_px_size);
++    hal_dcache_clean_invalidate(dest_vaddr_start, dest_stride * (dest_h - 1) + dest_w * dest_px_size);
+     g2d_bld info;
+     lv_memset(&info, 0, sizeof(g2d_bld));
+     info.bld_cmd = G2D_BLD_SRCOVER;
+@@ -417,7 +417,7 @@
+     info.src_image[1].clip_rect.y = src_area->y1;
+     info.src_image[1].clip_rect.w = src_w;
+     info.src_image[1].clip_rect.h = src_h;
+-    info.src_image[1].width = src_buf->header.w;
++    info.src_image[1].width = src_stride / src_px_size;
+     info.src_image[1].height = src_buf->header.h;
+     info.src_image[1].color = 0xee8899;
+     info.src_image[1].align[0] = 0;
+@@ -433,7 +433,7 @@
+     info.dst_image.clip_rect.y = dest_area->y1;
+     info.dst_image.clip_rect.w = dest_w;
+     info.dst_image.clip_rect.h = dest_h;
+-    info.dst_image.width = dest_buf->header.w;
++    info.dst_image.width = dest_stride / dest_px_size;
+     info.dst_image.height = dest_buf->header.h;
+     info.dst_image.mode = G2D_PIXEL_ALPHA;
+     info.dst_image.alpha = 255;

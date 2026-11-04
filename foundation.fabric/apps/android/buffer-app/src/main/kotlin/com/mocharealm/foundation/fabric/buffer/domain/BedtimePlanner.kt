@@ -25,6 +25,7 @@ internal object BedtimePlanner {
         lastTriggeredDay: Long,
         previous: BedtimeState,
         zone: TimeZone = TimeZone.getDefault(),
+        wasTriggered: (Long) -> Boolean = { it == lastTriggeredDay },
     ): BedtimePlan {
         if (!schedule.matches(Regex("(?:[01]\\d|2[0-3]):[0-5]\\d"))) {
             return BedtimePlan(BedtimeState())
@@ -50,13 +51,13 @@ internal object BedtimePlanner {
         if (targetToday <= now) target.add(Calendar.DATE, 1)
         val nextDaily = target.timeInMillis
 
-        var pending = previous.pendingDay.takeIf { it > 0 && it != lastTriggeredDay } ?: 0
+        var pending = previous.pendingDay.takeIf { it > 0 && !wasTriggered(it) } ?: 0
         // A delayed alarm or process restart may miss the original calendar day.
         if (previous.scheduledFor in 1..now) {
             val missedDay = dayOf(previous.scheduledFor)
-            if (missedDay != lastTriggeredDay) pending = maxOf(pending, missedDay)
+            if (!wasTriggered(missedDay)) pending = maxOf(pending, missedDay)
         }
-        if (now >= targetToday && today != lastTriggeredDay) pending = today
+        if (now >= targetToday && !wasTriggered(today)) pending = today
 
         if (pending == 0L) {
             return BedtimePlan(BedtimeState(scheduledFor = nextDaily), nextDaily)

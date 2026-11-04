@@ -1,9 +1,10 @@
 """Exercise production connect helper: loopback and injected socket failures."""
+from host_support import PROJECT_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root / 'app/buffer_app/buffer_wire.c').read_text()
 start = source.index('static int buffer_connect_address(')
 end = source.index('static char *buffer_base64(', start)
@@ -125,6 +126,6 @@ with tempfile.TemporaryDirectory(prefix='buffer-connect-') as temporary:
     work = Path(temporary)
     for name, code in [('real', real), ('faults', faults)]:
         (work / f'{name}.c').write_text(code)
-        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', str(work / f'{name}.c'),
+        subprocess.run([*CC, '-Wall', '-Wextra', '-Werror', str(work / f'{name}.c'),
                         '-o', str(work / name)], check=True)
         subprocess.run([str(work / name)], check=True, timeout=10)

@@ -21,6 +21,8 @@ fabric-registry.workspace = true
 fabric-session.workspace = true
 fabric-storage.workspace = true
 fabric-policy.workspace = true
+fabric-platform.workspace = true
+fabric-sdk.workspace = true
 fabric-clock = { workspace = true, optional = true }
 fabric-crypto = { workspace = true, optional = true }
 fabric-transport-quic = { workspace = true, optional = true }

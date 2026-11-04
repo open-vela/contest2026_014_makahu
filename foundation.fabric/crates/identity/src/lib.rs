@@ -108,6 +108,24 @@ pub struct FileDeviceTrustStore {
 }
 
 impl FileDeviceTrustStore {
+    /// Refresh the same authority after a portable pairing host durably commits
+    /// to its canonical trust file. This never imports an app-owned trust store.
+    pub fn reload(&self) -> Result<(), IdentityError> {
+        let mut cache = self
+            .entries
+            .write()
+            .map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        let entries = if self.path.exists() {
+            parse_trust_file(
+                &fs::read_to_string(&self.path)
+                    .map_err(|_| IdentityError::TrustStoreUnavailable)?,
+            )?
+        } else {
+            BTreeMap::new()
+        };
+        *cache = entries;
+        Ok(())
+    }
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, IdentityError> {
         let path = path.into();
         let entries = if path.exists() {
@@ -123,19 +141,39 @@ impl FileDeviceTrustStore {
         })
     }
 
-    fn persist(&self, entries: &BTreeMap<DeviceId, DeviceTrust>) -> Result<(), IdentityError> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-        {
+    // The portable C writer uses flock on this exact sidecar on Linux/Android.
+    // Hold it over reload + replacement, never lock the replaced inode itself.
+    fn lock_file(&self) -> Result<fs::File, IdentityError> {
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|_| IdentityError::TrustStoreUnavailable)?;
         }
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(".lock");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options
+            .open(PathBuf::from(name))
+            .map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        lock.lock()
+            .map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        Ok(lock)
+    }
+
+    fn persist(&self, entries: &BTreeMap<DeviceId, DeviceTrust>) -> Result<(), IdentityError> {
         let temporary = temporary_path(&self.path);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temporary)
             .map_err(|_| IdentityError::TrustStoreUnavailable)?;
         for (device, trust) in entries {
@@ -144,15 +182,27 @@ impl FileDeviceTrustStore {
         }
         file.sync_all()
             .map_err(|_| IdentityError::TrustStoreUnavailable)?;
-        if self.path.exists() {
-            fs::remove_file(&self.path).map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        // POSIX rename replaces atomically: unlinking first loses the authority
+        // entirely if the process dies between unlink and rename.
+        fs::rename(&temporary, &self.path).map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        #[cfg(unix)]
+        {
+            let parent = self
+                .path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| IdentityError::TrustStoreUnavailable)?;
         }
-        fs::rename(&temporary, &self.path).map_err(|_| IdentityError::TrustStoreUnavailable)
+        Ok(())
     }
 }
 
 impl DeviceTrustStore for FileDeviceTrustStore {
     fn trust(&self, device_id: DeviceId) -> Result<DeviceTrust, IdentityError> {
+        self.reload()?;
         Ok(self
             .entries
             .read()
@@ -163,19 +213,25 @@ impl DeviceTrustStore for FileDeviceTrustStore {
     }
 
     fn set_trust(&self, device_id: DeviceId, trust: DeviceTrust) -> Result<(), IdentityError> {
-        let mut entries = self
+        let _lock = self.lock_file()?;
+        self.reload()?;
+        let mut cache = self
             .entries
             .write()
             .map_err(|_| IdentityError::TrustStoreUnavailable)?;
+        let mut next = cache.clone();
         if trust == DeviceTrust::Unknown {
-            entries.remove(&device_id);
+            next.remove(&device_id);
         } else {
-            entries.insert(device_id, trust);
+            next.insert(device_id, trust);
         }
-        self.persist(&entries)
+        self.persist(&next)?;
+        *cache = next;
+        Ok(())
     }
 
     fn entries(&self) -> Result<Vec<(DeviceId, DeviceTrust)>, IdentityError> {
+        self.reload()?;
         Ok(self
             .entries
             .read()
@@ -641,5 +697,24 @@ mod tests {
             Ok(DeviceTrust::Unknown)
         );
         let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn independent_writers_preserve_pairing_and_observe_revocation() {
+        let path = std::env::temp_dir().join(format!("fabric-shared-{}.txt", std::process::id()));
+        let a = FileDeviceTrustStore::open(&path).unwrap();
+        let b = FileDeviceTrustStore::open(&path).unwrap();
+        let paired = DeviceId([71; 32]);
+        let other = DeviceId([72; 32]);
+        a.set_trust(paired, DeviceTrust::Trusted).unwrap();
+        b.set_trust(other, DeviceTrust::Trusted).unwrap();
+        assert_eq!(a.trust(paired), Ok(DeviceTrust::Trusted));
+        assert_eq!(a.trust(other), Ok(DeviceTrust::Trusted));
+        b.set_trust(paired, DeviceTrust::Blocked).unwrap();
+        assert_eq!(a.trust(paired), Ok(DeviceTrust::Blocked));
+        a.remove(other).unwrap();
+        assert_eq!(b.trust(other), Ok(DeviceTrust::Unknown));
+        assert_eq!(b.trust(paired), Ok(DeviceTrust::Blocked));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}.lock", path.display()));
     }
 }

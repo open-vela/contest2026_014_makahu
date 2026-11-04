@@ -7,6 +7,9 @@
 #include <nuttx/config.h>
 
 #include "buffer_app.h"
+#include "buffer_agent.h"
+#include "buffer_fabric.h"
+#include "buffer_deck.h"
 
 #include <mbedtls/md.h>
 #include <arpa/inet.h>
@@ -803,6 +806,80 @@ static int buffer_parse_focus_config(cJSON *root, struct buffer_focus_config_s *
   return 1;
 }
 
+int buffer_wire_parse_runtime_state(const char *message, uint64_t *revision,
+                                    char *mode, size_t mode_size,
+                                    struct buffer_focus_config_s *focus,
+                                    struct buffer_research_s *research)
+{
+  cJSON *root;
+  cJSON *type;
+  cJSON *protocol;
+  cJSON *revision_value;
+  cJSON *mode_value;
+  struct buffer_focus_config_s parsed_focus;
+  struct buffer_research_s parsed_research;
+  uint64_t parsed_revision;
+  const char *parsed_mode;
+  int focus_result;
+  int research_result;
+  int ret = -EINVAL;
+
+  if (message == NULL || revision == NULL || mode == NULL || mode_size == 0 ||
+      focus == NULL || research == NULL)
+    {
+      return -EINVAL;
+    }
+
+  root = cJSON_Parse(message);
+  if (root == NULL)
+    {
+      return -EINVAL;
+    }
+
+  type = cJSON_GetObjectItemCaseSensitive(root, "type");
+  protocol = cJSON_GetObjectItemCaseSensitive(root, "protocol");
+  revision_value = cJSON_GetObjectItemCaseSensitive(root, "revision");
+  mode_value = cJSON_GetObjectItemCaseSensitive(root, "mode");
+  if (!cJSON_IsObject(root) || (cJSON_GetArraySize(root) != 6 + (cJSON_GetObjectItemCaseSensitive(root,"focus_session") != NULL)+(cJSON_GetObjectItemCaseSensitive(root,"coordinator_term") != NULL)) ||
+      !cJSON_IsString(type) || strcmp(type->valuestring, "buffer.runtime.state") ||
+      !cJSON_IsNumber(protocol) || protocol->valuedouble != 1 ||
+      !cJSON_IsNumber(revision_value) ||
+      !(revision_value->valuedouble >= 1 &&
+        revision_value->valuedouble <= 9007199254740991.0) ||
+      revision_value->valuedouble != (double)(uint64_t)revision_value->valuedouble ||
+      !cJSON_IsString(mode_value) || mode_value->valuestring == NULL)
+    {
+      goto done;
+    }
+
+  parsed_mode = mode_value->valuestring;
+  if ((strcmp(parsed_mode, "normal") && strcmp(parsed_mode, "focus") &&
+       strcmp(parsed_mode, "bedtime") && strcmp(parsed_mode, "rabbit_hole")) ||
+      strlen(parsed_mode) >= mode_size || mode_size < BUFFER_MODE_SIZE)
+    {
+      goto done;
+    }
+
+  focus_result = buffer_parse_focus_config(root, &parsed_focus);
+  research_result = buffer_parse_research(root, &parsed_research);
+  if (focus_result != 1 || research_result != 1 ||
+      parsed_focus.active != (strcmp(parsed_mode, "focus") == 0))
+    {
+      goto done;
+    }
+
+  parsed_revision = (uint64_t)revision_value->valuedouble;
+  memcpy(mode, parsed_mode, strlen(parsed_mode) + 1);
+  *revision = parsed_revision;
+  *focus = parsed_focus;
+  *research = parsed_research;
+  ret = 0;
+
+done:
+  cJSON_Delete(root);
+  return ret;
+}
+
 static int buffer_apply_cards(const char *response)
 {
   struct buffer_card_s cards[BUFFER_CARD_LIMIT];
@@ -852,7 +929,12 @@ static int buffer_apply_cards(const char *response)
   if (response_mode != NULL && cJSON_IsString(response_mode) &&
       response_mode->valuestring != NULL)
     {
-      buffer_sync_remote_mode(response_mode->valuestring);
+      ret = buffer_sync_remote_mode(response_mode->valuestring);
+      if (ret < 0)
+        {
+          cJSON_Delete(root);
+          return ret;
+        }
     }
 
   if (array != NULL && cJSON_IsArray(array))
@@ -884,6 +966,8 @@ static int buffer_apply_cards(const char *response)
           cJSON *created = cJSON_GetObjectItemCaseSensitive(item, "created_at");
           cards[count].created_at = created != NULL && cJSON_IsNumber(created)
                                     ? (int64_t)created->valuedouble : 0;
+          buffer_deck_metadata(&cards[count],item);
+          if (cJSON_IsString(response_mode) && !strcmp(response_mode->valuestring,"bedtime") && !cards[count].bedtime_readable) continue;
           if (cards[count].card_id[0] != '\0')
             {
               count++;
@@ -1288,6 +1372,7 @@ int buffer_wire_sync_once(void)
   int ret;
   int sync_error = 0;
   bool upload_failed = false;
+  bool capture_locked = false;
 
   buffer_wire_load_standalone_state();
   buffer_wire_refresh_pending_count();
@@ -1492,8 +1577,9 @@ int buffer_wire_sync_once(void)
           pthread_mutex_lock(&g_buffer.lock);
           /* A newer local mode may have been selected while the request was
            * on the wire.  Only consume the mode that produced this ACK. */
-          if (g_buffer.mode_dirty != false &&
-              strcmp(g_buffer.mode_id, mode_id) == 0)
+          if (g_buffer.mode_dirty &&
+              strcmp(g_buffer.mode_id, mode_id) == 0 &&
+              strcmp(g_buffer.mode, mode) == 0)
             {
               /* Do not drop the durable pending file until the normal mode
                * file is also committed.  A transient write failure must
@@ -1501,11 +1587,14 @@ int buffer_wire_sync_once(void)
               persist_ret = buffer_store_save_mode(mode);
               if (persist_ret == 0)
                 {
-                  g_buffer.mode_dirty = false;
                   /* The local mode setter also writes this file while holding
                    * the same lock.  Clear it before releasing the lock so a
                    * newer mode cannot be deleted by this older ACK. */
-                  buffer_store_clear_pending_mode();
+                  persist_ret = buffer_store_clear_pending_mode();
+                  if (persist_ret == 0)
+                    {
+                      g_buffer.mode_dirty = false;
+                    }
                 }
             }
           pthread_mutex_unlock(&g_buffer.lock);
@@ -1542,13 +1631,19 @@ int buffer_wire_sync_once(void)
           if (g_buffer.action_requested != false &&
               strcmp(g_buffer.action_id, action_id) == 0)
             {
-              g_buffer.action_requested = false;
               /* buffer_request_action() persists a replacement while holding
                * this lock.  Remove the acknowledged file before unlocking so
                * that replacement cannot be mistaken for the old ACK. */
-              buffer_store_clear_pending_action();
+              ret = buffer_store_clear_pending_action();
+              if (!ret) g_buffer.action_requested = false;
             }
           pthread_mutex_unlock(&g_buffer.lock);
+          if (ret < 0)
+            {
+              sync_error = ret;
+              buffer_set_status("卡片操作回执保存失败，稍后重试");
+              goto sync_done;
+            }
         }
       else
         {
@@ -1558,6 +1653,8 @@ int buffer_wire_sync_once(void)
         }
     }
 
+  pthread_mutex_lock(&g_buffer_capture_lock);
+  capture_locked = true;
   char (*ids)[BUFFER_ID_SIZE] = calloc(CONFIG_BUFFER_VELA_QUEUE_LIMIT,
                                        sizeof(*ids));
   if (ids == NULL)
@@ -1790,6 +1887,7 @@ int buffer_wire_sync_once(void)
     }
 
 sync_done:
+  if (capture_locked) pthread_mutex_unlock(&g_buffer_capture_lock);
   close(fd);
   free(response);
   return sync_error;
@@ -1814,7 +1912,15 @@ void *buffer_wire_thread_main(void *arg)
           break;
         }
 
-      int sync_ret = buffer_wire_sync_once();
+      bool fabric_bound=false;
+#ifdef CONFIG_BUFFER_VELA_FABRIC
+      struct buffer_fabric_status_s fabric;
+      buffer_fabric_snapshot(&fabric);
+      fabric_bound=fabric.binding==0;
+#endif
+      /* The Fabric binding is a separate authenticated route. A missing
+       * legacy phone.conf must not reopen pairing or overwrite Agent status. */
+      int sync_ret = fabric_bound ? -EACCES : buffer_wire_sync_once();
       pthread_mutex_lock(&g_buffer.lock);
       g_buffer.phone_synced = sync_ret == 0;
       pthread_mutex_unlock(&g_buffer.lock);

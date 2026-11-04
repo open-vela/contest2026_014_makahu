@@ -1,8 +1,9 @@
 """Run production GATT service callbacks with a controlled Bluetooth/Wi-Fi boundary."""
+from host_support import PROJECT_ROOT, SDK_ROOT, CC
 from pathlib import Path
 import re, subprocess, tempfile
-root=Path(__file__).resolve().parents[1]
-app=root/'app/buffer_app'; cjson=root.parent/'apps/netutils/cjson/cJSON'
+root = PROJECT_ROOT
+app=root/'app/buffer_app'; cjson=SDK_ROOT / 'apps/netutils/cjson/cJSON'
 source=re.sub(r'^#include .*$', '', (app/'buffer_ble_service.c').read_text(),flags=re.M)
 harness=r'''
 #include <assert.h>
@@ -162,5 +163,5 @@ int main(void){
 with tempfile.TemporaryDirectory() as tmp:
     t=Path(tmp);(t/'netutils').mkdir();(t/'netutils/cJSON.h').symlink_to(cjson/'cJSON.h')
     (t/'test.c').write_text(harness)
-    subprocess.run(['cc','-std=c11','-D_POSIX_C_SOURCE=200809L','-Wall','-Wextra','-Werror','-pthread','-I'+str(app),'-I'+tmp,'-I'+str(cjson),str(t/'test.c'),str(app/'buffer_enrollment.c'),str(cjson/'cJSON.c'),'-lm','-o',str(t/'test')],check=True)
+    subprocess.run([*CC,'-std=c11','-D_POSIX_C_SOURCE=200809L','-Wall','-Wextra','-Werror','-pthread','-I'+str(app),'-I'+tmp,'-I'+str(cjson),str(t/'test.c'),str(app/'buffer_enrollment.c'),str(cjson/'cJSON.c'),'-lm','-o',str(t/'test')],check=True)
     subprocess.run([str(t/'test')],check=True,timeout=20)

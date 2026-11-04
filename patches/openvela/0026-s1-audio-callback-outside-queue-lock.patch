@@ -1,0 +1,468 @@
+diff --git a/chips/r528/components/audio/sunxi_alsa.c b/chips/r528/components/audio/sunxi_alsa.c
+index 5889bb04..08afe236 100755
+--- a/chips/r528/components/audio/sunxi_alsa.c
++++ b/chips/r528/components/audio/sunxi_alsa.c
+@@ -50,6 +50,7 @@
+ 
+ #include <nuttx/kmalloc.h>
+ #include <nuttx/mqueue.h>
++#include <nuttx/semaphore.h>
+ #include <nuttx/queue.h>
+ #include <nuttx/clock.h>
+ #include <nuttx/wqueue.h>
+@@ -186,21 +187,17 @@ static const struct audio_ops_s g_audio_ops =
+ static int sunxi_get_latency(struct audio_lowerhalf_s *dev,
+ 								unsigned long arg)
+ {
++	irqstate_t flags;
+ 	struct sunxi_dev_s *priv = (struct sunxi_dev_s *)dev;
+ 	long *latency = (long *)arg;
+ 	struct ap_buffer_s *apb;
+ 	dq_entry_t *cur;
+ 	long remain = 0;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (priv->handle)
+ 		snd_vela_pcm_delay(priv->handle, latency);
+-	ret = nxmutex_lock(&priv->pendlock);
+-	if (ret < 0)
+-	{
+-		syslog(LOG_ERR, "%d, %s\n", __LINE__, __func__);
+-		return ret;
+-	}
++	flags = spin_lock_irqsave(&priv->pendlock);
+ 
+ 	for (cur = dq_peek(&priv->pendq); cur; cur = dq_next(cur))
+ 	{
+@@ -208,7 +205,7 @@ static int sunxi_get_latency(struct audio_lowerhalf_s *dev,
+ 		remain += apb->nbytes - apb->curbyte;
+ 	}
+ 
+-	nxmutex_unlock(&priv->pendlock);
++	spin_unlock_irqrestore(&priv->pendlock, flags);
+ 	*latency += remain / (priv->bpsamp / 8 * priv->nchannels);
+ 
+ 	return ret;
+@@ -568,6 +565,12 @@ static int sunxi_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
+ 	FAR struct sunxi_dev_s *priv = (FAR struct sunxi_dev_s *)dev;
+ 
+ 	DEBUGASSERT(priv);
++	/* The upper half may already have freed buffers prepared but never run.
++	 * Drop queue links without dereferencing those former buffer pointers. */
++	irqstate_t flags = spin_lock_irqsave(&priv->pendlock);
++	dq_init(&priv->pendq);
++	spin_unlock_irqrestore(&priv->pendlock, flags);
++	nxsem_reset(&priv->pendsem, 0);
+ 
+ 	/* Now issue a software reset. This puts all audio registers back in
+ 	* their default state.
+@@ -588,16 +591,40 @@ static int sunxi_audio_shutdown(FAR struct audio_lowerhalf_s *dev)
+  *
+  ****************************************************************************/
+ 
++static int record_read_failed(FAR struct sunxi_dev_s *priv,
++                              FAR struct ap_buffer_s *apb, int error)
++{
++	bool stopping = !priv->running;
++	priv->running = false;
++	apb->nbytes = 0;
++	syslog(stopping ? LOG_INFO : LOG_ERR, "pcm read ended: %d\n", error);
++	/* A removed buffer must be returned even when STOP cancels the read.
++	 * Otherwise the upper tail never catches the application head at close. */
++#ifdef CONFIG_AUDIO_MULTI_SESSION
++	if (!stopping)
++		priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_IOERR, apb, -error, NULL);
++	priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, -error, NULL);
++#else
++	if (!stopping)
++		priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_IOERR, apb, -error);
++	priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, -error);
++#endif
++	return error;
++}
++
+ static int record_fillonebuffer(FAR struct sunxi_dev_s *priv)
+ {
++	irqstate_t flags;
+ 	FAR struct ap_buffer_s *apb;
+ 	int ret = 0;
+ 
+-	if (dq_peek(&priv->pendq) != NULL)
+-	{
+-		/* Take next buffer from the queue of pending transfers */
++	flags = spin_lock_irqsave(&priv->pendlock);
++	apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq);
++	spin_unlock_irqrestore(&priv->pendlock, flags);
+ 
+-		apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq);
++	if (apb != NULL)
++	{
++		/* Read and notify outside pendlock: the upper callback can enqueue. */
+ 
+ 		audinfo("filling: apb=%p curbyte=%d nbytes=%d flags=%04x\n",
+ 				apb, apb->curbyte, apb->nbytes, apb->flags);
+@@ -617,8 +644,7 @@ static int record_fillonebuffer(FAR struct sunxi_dev_s *priv)
+ 			f = pcm_read(priv->handle, (char *)apb->samp, f, frame_bytes);
+ 			if (f < 0)
+ 			{
+-				syslog(LOG_ERR, "pcm read error, return %ld\n", f);
+-				return f;
++				return record_read_failed(priv, apb, (int)f);
+ 			}
+ 		}
+ 
+@@ -646,35 +672,32 @@ static int record_fillonebuffer(FAR struct sunxi_dev_s *priv)
+ 
+ static int record_fillbuffer(FAR struct sunxi_dev_s *priv)
+ {
++	irqstate_t flags;
+ 	FAR struct ap_buffer_s *apb;
+ 	int ret = 0;
+ 	unsigned int frame_bytes = 0;
+ 
+-	/* Loop while there are audio buffers to be sent and we have few than
+-	* CONFIG_AW_AUDIO_DMIC_INFLIGHT then "in-flight"
+-	*
+-	* The 'inflight' value might be modified from the interrupt level in some
+-	* implementations.  We will use interrupt controls to protect against
+-	* that possibility.
+-	*
+-	* The 'pendq', on the other hand, is protected via a semaphore.  Let's
+-	* hold the semaphore while we are busy here and disable the interrupts
+-	* only while accessing 'inflight'.
+-	*/
++	/* Protect only queue removal. PCM reads and upper callbacks can block or
++	 * re-enter enqueuebuffer and therefore run without pendlock. */
+ 
+ 	if (!priv->running)
+ 		return ret;
+ 
+-	ret = nxmutex_lock(&priv->pendlock);
+-
+ 	if (priv->handle)
+ 		frame_bytes = snd_vela_pcm_frames_to_bytes(priv->handle, 1);
+ 
+-	while (dq_peek(&priv->pendq) != NULL)
++	while (priv->running)
+ 	{
+ 		/* Take next buffer from the queue of pending transfers */
+ 
++		flags = spin_lock_irqsave(&priv->pendlock);
+ 		apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq);
++		spin_unlock_irqrestore(&priv->pendlock, flags);
++		if (apb == NULL)
++			break;
++		/* Bulk draining also consumes its enqueue wakeups. */
++		nxsem_trywait(&priv->pendsem);
++		/* Blocking reads and callbacks can synchronously re-enter enqueue. */
+ 
+ 		syslog(LOG_INFO,"filling: apb=%p curbyte=%d nbytes=%d flags=%04x\n",
+ 				apb, apb->curbyte, apb->nbytes, apb->flags);
+@@ -701,9 +724,7 @@ static int record_fillbuffer(FAR struct sunxi_dev_s *priv)
+ 			f = pcm_read(priv->handle, (char *)apb->samp, f, frame_bytes);
+ 			if (f < 0)
+ 			{
+-				syslog(LOG_ERR, "pcm read error, return %ld\n", f);
+-				nxmutex_unlock(&priv->pendlock);
+-				return f;
++				return record_read_failed(priv, apb, (int)f);
+ 			}
+ 		}
+ 
+@@ -715,7 +736,6 @@ static int record_fillbuffer(FAR struct sunxi_dev_s *priv)
+ 
+ 	}
+ 
+-	nxmutex_unlock(&priv->pendlock);
+ 	return ret;
+ }
+ 
+@@ -922,6 +942,7 @@ static int sunxi_audio_stop(FAR struct audio_lowerhalf_s *dev)
+ 	term_msg.msg_id = AUDIO_MSG_STOP;
+ 	term_msg.u.data = 0;
+ 	priv->running = false;
++	if (priv->record) nxsem_post(&priv->pendsem);
+ 	//priv->paused = false;
+ 
+ 	pthread_cond_signal(&priv->cond_pause);
+@@ -1074,6 +1095,7 @@ static int sunxi_audio_resume(FAR struct audio_lowerhalf_s *dev)
+ static int sunxi_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
+ 									FAR struct ap_buffer_s *apb)
+ {
++	irqstate_t flags;
+ 	FAR struct sunxi_dev_s *priv = (FAR struct sunxi_dev_s *)dev;
+ 	struct audio_msg_s term_msg;
+ 	int ret;
+@@ -1093,16 +1115,11 @@ static int sunxi_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
+ 	audinfo("Enqueueing: apb=%p curbyte=%d nbytes=%d flags=%04x\n",
+ 			apb, apb->curbyte, apb->nbytes, apb->flags);
+ 
+-	ret = nxmutex_lock(&priv->pendlock);
+-	if (ret < 0)
+-	{
+-		syslog(LOG_INFO, "%d, %s\n", __LINE__, __func__);
+-		return ret;
+-	}
++	flags = spin_lock_irqsave(&priv->pendlock);
+ 
+ 	/* Add the new buffer to the tail of pending audio buffers */
+ 	dq_addlast(&apb->dq_entry, &priv->pendq);
+-	nxmutex_unlock(&priv->pendlock);
++	spin_unlock_irqrestore(&priv->pendlock, flags);
+ 
+ 	/* Send a message to the worker thread indicating that a new buffer has
+ 	* been enqueued.If mq is NULL, then the playing has not yet started.
+@@ -1110,6 +1127,12 @@ static int sunxi_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
+ 	* any message.
+ 	*/
+ 
++	/* Called with the upper spinlock held: posting must not allocate memory. */
++	if (priv->record)
++	{
++		nxsem_post(&priv->pendsem);
++		return OK;
++	}
+ 	ret = OK;
+ 	if (priv->mq.f_inode != NULL)
+ 	{
+@@ -1118,7 +1141,11 @@ static int sunxi_audio_enqueuebuffer(FAR struct audio_lowerhalf_s *dev,
+ 
+ 		ret = file_mq_send(&priv->mq, (FAR const char *)&term_msg,
+ 							sizeof(term_msg), prio);
+-		if (ret < 0)
++		/* The buffer is already accepted. A full notification queue already
++		 * guarantees a wakeup, so do not report a failed buffer enqueue. */
++		if (ret == -EAGAIN)
++			ret = OK;
++		else if (ret < 0)
+ 		{
+ 			syslog(LOG_ERR, "ERROR: file_mq_send failed: %d\n", ret);
+ 		}
+@@ -1250,11 +1277,9 @@ static int sunxi_audio_release(FAR struct audio_lowerhalf_s *dev)
+ 
+ static void record_workerthread(void *arg)
+ {
++	irqstate_t flags;
+ 	FAR struct sunxi_dev_s *priv = (struct sunxi_dev_s *)arg;
+-	struct audio_msg_s msg;
+ 	FAR struct ap_buffer_s *apb;
+-	int msglen;
+-	unsigned int prio;
+ 
+ 	syslog(LOG_INFO,"Entry\n");
+ 
+@@ -1297,74 +1322,18 @@ static void record_workerthread(void *arg)
+ 
+ 	while (priv->running)
+ 	{
+-		/* Check if we have been asked to terminate.  We have to check if we
+-		* still have buffers in-flight.  If we do, then we can't stop until
+-		* birds come back to roost.
+-		*/
+-
+-		if (priv->terminating)
+-		{
+-			/* We are IDLE.  Break out of the loop and exit. */
+-
++		int wait_ret = nxsem_wait_uninterruptible(&priv->pendsem);
++		if (wait_ret < 0 || !priv->running)
+ 			break;
+-		}
+-
+ 		if (priv->paused)
+ 		{
+-			/* We are pause.. */
+ 			pthread_mutex_lock(&priv->mutex);
+-			pthread_cond_wait(&priv->cond_pause, &priv->mutex);
++			while (priv->paused && priv->running)
++				pthread_cond_wait(&priv->cond_pause, &priv->mutex);
+ 			pthread_mutex_unlock(&priv->mutex);
+-			if (!priv->running)
+-				break;
+-		}
+-
+-		/* Wait for messages from our message queue */
+-
+-		msglen = file_mq_receive(&priv->mq, (FAR char *)&msg,
+-								sizeof(msg), &prio);
+-
+-		/* Handle the case when we return with no message */
+-
+-		if (msglen < sizeof(struct audio_msg_s))
+-		{
+-			syslog(LOG_ERR, "ERROR: Message too small: %d\n", msglen);
+-			continue;
+-		}
+-
+-		/* Process the message */
+-
+-		switch (msg.msg_id)
+-		{
+-			/* Stop the playback */
+-
+-#ifndef CONFIG_AUDIO_EXCLUDE_STOP
+-			case AUDIO_MSG_STOP:
+-
+-			/* Indicate that we are terminating */
+-
+-			syslog(LOG_INFO,"AUDIO_MSG_STOP: Terminating\n");
+-			priv->terminating = true;
+-			break;
+-#endif
+-
+-			/* We have a new buffer to fill.  We will catch this case at
+-			* the top of the loop.
+-			*/
+-
+-			case AUDIO_MSG_ENQUEUE:
+-			audinfo("AUDIO_MSG_ENQUEUE\n");
+-			record_fillonebuffer(priv);
+-			break;
+-
+-			case AUDIO_MSG_COMPLETE:
+-			syslog(LOG_INFO,"AUDIO_MSG_COMPLETE\n");
+-			break;
+-
+-			default:
+-			syslog(LOG_ERR, "ERROR: Ignoring message ID %d\n", msg.msg_id);
+-			break;
++			if (!priv->running) break;
+ 		}
++		record_fillonebuffer(priv);
+ 	}
+ 
+ 	/* Reset the audio param */
+@@ -1373,9 +1342,13 @@ static void record_workerthread(void *arg)
+ 
+ 	/* Return any pending buffers in our pending queue */
+ 
+-	nxmutex_lock(&priv->pendlock);
+-	while ((apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq)) != NULL)
++	for (;;)
+ 	{
++		flags = spin_lock_irqsave(&priv->pendlock);
++		apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq);
++		spin_unlock_irqrestore(&priv->pendlock, flags);
++		if (apb == NULL)
++			break;
+ 
+ 		/* Send the buffer back up to the previous level. */
+ 
+@@ -1386,7 +1359,7 @@ static void record_workerthread(void *arg)
+ #endif
+ 	}
+ 
+-	nxmutex_unlock(&priv->pendlock);
++	nxsem_reset(&priv->pendsem, 0);
+ 
+ 	/* Close the message queue */
+ 
+@@ -1415,6 +1388,7 @@ static void record_workerthread(void *arg)
+ 
+ static void play_workerthread(void *arg)
+ {
++	irqstate_t flags;
+ 	FAR struct sunxi_dev_s *priv = (struct sunxi_dev_s *)arg;
+ 	struct audio_msg_s msg;
+ 	struct ap_buffer_s *apb;
+@@ -1468,7 +1442,9 @@ static void play_workerthread(void *arg)
+ 	}
+ 
+ 	while (priv->running) {
++		flags = spin_lock_irqsave(&priv->pendlock);
+ 		apb = (struct ap_buffer_s *)dq_peek(&priv->pendq);
++		spin_unlock_irqrestore(&priv->pendlock, flags);
+ 		if (!apb) {
+ 			usleep(5000);
+ 			continue;
+@@ -1521,9 +1497,9 @@ static void play_workerthread(void *arg)
+ 			break;
+ 		}
+ 
+-		nxmutex_lock(&priv->pendlock);
++		flags = spin_lock_irqsave(&priv->pendlock);
+ 		dq_remfirst(&priv->pendq);
+-		nxmutex_unlock(&priv->pendlock);
++		spin_unlock_irqrestore(&priv->pendlock, flags);
+ 
+ 		dq_before++;
+ 		priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
+@@ -1576,9 +1552,13 @@ static void play_workerthread(void *arg)
+ 		equalizer = NULL;
+ 	}
+ 
+-	nxmutex_lock(&priv->pendlock);
+-	while ((apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq)) != NULL)
++	for (;;)
+ 	{
++		flags = spin_lock_irqsave(&priv->pendlock);
++		apb = (FAR struct ap_buffer_s *)dq_remfirst(&priv->pendq);
++		spin_unlock_irqrestore(&priv->pendlock, flags);
++		if (apb == NULL)
++			break;
+ 
+ 		/* Send the buffer back up to the previous level. */
+ 
+@@ -1588,7 +1568,6 @@ static void play_workerthread(void *arg)
+ 		priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, OK);
+ #endif
+ 	}
+-	nxmutex_unlock(&priv->pendlock);
+ 
+ 	/* Close the message queue */
+ 	file_mq_close(&priv->mq);
+@@ -1679,7 +1658,6 @@ FAR struct audio_lowerhalf_s *
+   sunxi_audio_initialize(bool record, int index)
+ {
+ 	FAR struct sunxi_dev_s *priv;
+-	int ret = 0;
+ 
+ 	/* Allocate a audio device structure */
+ 
+@@ -1695,12 +1673,8 @@ FAR struct audio_lowerhalf_s *
+ 	priv->record	= record;
+ 	priv->index		= index;
+ 
+-	ret = nxmutex_init(&priv->pendlock);
+-	if (ret < 0)
+-	{
+-		syslog(LOG_ERR, "nxmutex_init error:%d\n", ret);
+-		goto errout_with_dev;
+-	}
++	spin_lock_init(&priv->pendlock);
++	nxsem_init(&priv->pendsem, 0, 0);
+ 
+ 	dq_init(&priv->pendq);
+ 
+@@ -1722,7 +1696,7 @@ FAR struct audio_lowerhalf_s *
+ 	return &priv->dev;
+ 
+ errout_with_dev:
+-	nxmutex_destroy(&priv->pendlock);
++	nxsem_destroy(&priv->pendsem);
+ 	if (priv)
+ 		kmm_free(priv);
+ 	return NULL;
+diff --git a/chips/r528/components/audio/sunxi_alsa.h b/chips/r528/components/audio/sunxi_alsa.h
+index ac4323e9..a7d329cf 100755
+--- a/chips/r528/components/audio/sunxi_alsa.h
++++ b/chips/r528/components/audio/sunxi_alsa.h
+@@ -49,6 +49,7 @@
+ #include <sys/param.h>
+ 
+ #include <nuttx/compiler.h>
++#include <nuttx/spinlock.h>
+ 
+ #include <pthread.h>
+ #include <mqueue.h>
+@@ -187,7 +188,8 @@ struct sunxi_dev_s
+ 	pthread_mutex_t         mutex;            /* Thread sync mutex */
+ 	pthread_cond_t          cond_pause;       /* For synchronization */
+ 	int16_t                 index;            /* index: 0:audiocodec, 1:dmic */
+-	mutex_t                 pendlock;         /* Protect pendq */
++	spinlock_t              pendlock;         /* Protect pendq */
++	sem_t                   pendsem;          /* Allocation-free capture wakeup */
+ 	uint16_t                samprate;         /* Configured samprate (samples/sec) */
+ #ifndef CONFIG_AUDIO_EXCLUDE_VOLUME
+ 	uint8_t                 volume;           /* Current volume level {0..63} */

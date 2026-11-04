@@ -15,7 +15,7 @@ class BufferBridgeService : Service() {
         val notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Buffer")
             .setContentText("正在等待 Gemini S1 同步")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ms_info)
             .setOngoing(true)
             .setContentIntent(QuickCaptureEntry.pendingIntent(this, null))
             .addAction(Notification.Action.Builder(null, getString(R.string.capture_text),

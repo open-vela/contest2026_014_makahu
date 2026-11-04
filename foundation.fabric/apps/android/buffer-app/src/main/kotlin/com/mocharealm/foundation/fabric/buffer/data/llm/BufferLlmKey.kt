@@ -11,6 +11,7 @@ import javax.crypto.spec.GCMParameterSpec
 /** API credentials remain on this phone and are never part of replicated events. */
 internal object BufferLlmKey {
     private const val ALIAS = "buffer-llm-api-key"
+    private val cache = BufferLlmSecretCache(::decryptUncached)
     @Synchronized private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(ALIAS, null) as? SecretKey)?.let { return it }
@@ -20,11 +21,14 @@ internal object BufferLlmKey {
         }.generateKey()
     }
     fun encrypt(value: String): String {
-        if (value.isEmpty()) return ""
+        if (value.isEmpty()) { cache.remember("", ""); return "" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
         return Base64.encodeToString(cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+            .also { cache.remember(it, value) }
     }
-    fun decrypt(value: String): String {
+    fun decrypt(value: String): String = cache.decrypt(value)
+    fun clearCached() { cache.remember("", "") }
+    private fun decryptUncached(value: String): String {
         if (value.isEmpty()) return ""
         val bytes = Base64.decode(value, Base64.NO_WRAP)
         require(bytes.size >= 28) { "请重新保存 API Key" }

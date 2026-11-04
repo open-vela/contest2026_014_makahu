@@ -30,6 +30,7 @@ pub enum EpochPolicy {
     New,
     Exact,
     Next,
+    CurrentOrNext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +123,11 @@ impl ControlSecurity {
 
     pub fn set_session_epoch(&mut self, session_id: SessionId, epoch: u64) {
         self.session_epochs.insert(session_id, epoch);
+    }
+
+    #[must_use]
+    pub fn session_epoch(&self, session_id: SessionId) -> Option<u64> {
+        self.session_epochs.get(&session_id).copied()
     }
 
     pub fn remove_session(&mut self, session_id: SessionId) {
@@ -221,7 +227,9 @@ impl ControlSecurity {
                 actual: header.expected_epoch,
             }),
             (EpochPolicy::New, Some(_)) => Err(SecurityError::SessionAlreadyExists),
-            (EpochPolicy::Exact | EpochPolicy::Next, None) => Err(SecurityError::UnknownSession),
+            (EpochPolicy::Exact | EpochPolicy::Next | EpochPolicy::CurrentOrNext, None) => {
+                Err(SecurityError::UnknownSession)
+            }
             (EpochPolicy::Exact, Some(current)) => {
                 check_expected_epoch(current, header.expected_epoch)
             }
@@ -229,6 +237,16 @@ impl ControlSecurity {
                 current.checked_add(1).ok_or(SecurityError::EpochOverflow)?,
                 header.expected_epoch,
             ),
+            (EpochPolicy::CurrentOrNext, Some(current)) => {
+                if header.expected_epoch == current {
+                    Ok(())
+                } else {
+                    check_expected_epoch(
+                        current.checked_add(1).ok_or(SecurityError::EpochOverflow)?,
+                        header.expected_epoch,
+                    )
+                }
+            }
         }
     }
 
@@ -411,6 +429,53 @@ mod tests {
                 16
             ),
             Ok(IngressDecision::Execute)
+        );
+    }
+
+    #[test]
+    fn permits_current_epoch_retry_for_next_epoch_control() {
+        let mut guard = ControlSecurity::new(ControlSecurityConfig::default()).unwrap();
+        let mut current = header(OperationId::new(), 4);
+        current.expected_epoch = 3;
+        guard.set_session_epoch(current.session_id, 3);
+        assert_eq!(
+            guard.authorize(
+                &current,
+                DeviceId([1; 32]),
+                b"committed-retry",
+                EpochPolicy::CurrentOrNext,
+                10,
+            ),
+            Ok(IngressDecision::Execute)
+        );
+
+        let mut next = header(OperationId::new(), 5);
+        next.expected_epoch = 4;
+        assert_eq!(
+            guard.authorize(
+                &next,
+                DeviceId([1; 32]),
+                b"next",
+                EpochPolicy::CurrentOrNext,
+                11,
+            ),
+            Ok(IngressDecision::Execute)
+        );
+
+        let mut stale = header(OperationId::new(), 6);
+        stale.expected_epoch = 2;
+        assert_eq!(
+            guard.authorize(
+                &stale,
+                DeviceId([1; 32]),
+                b"old",
+                EpochPolicy::CurrentOrNext,
+                12,
+            ),
+            Err(SecurityError::StaleEpoch {
+                expected: 4,
+                actual: 2,
+            })
         );
     }
 

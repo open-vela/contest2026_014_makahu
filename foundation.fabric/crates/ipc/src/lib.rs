@@ -183,6 +183,25 @@ struct ActiveSession {
 }
 
 impl<A: OsCredentialAdapter> IpcServer<A> {
+    /// Check the live OS-authenticated connection and its published ability.
+    /// A plan's claimed principal alone is never sufficient authority.
+    pub fn authorize_participant(
+        &self,
+        connection: ConnectionId,
+        participant: &fabric_core::Participant,
+    ) -> Result<(), IpcError> {
+        let connections = self.connections.lock().map_err(|_| IpcError::Poisoned)?;
+        let owner = connections
+            .get(&connection)
+            .ok_or(IpcError::ConnectionNotFound)?;
+        if owner.principal != participant.app_principal
+            || !owner.offers.contains(&participant.ability_instance)
+        {
+            return Err(IpcError::PrincipalMismatch);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn new(credentials: A, registry: Arc<Registry>) -> Self {
         Self {
@@ -415,6 +434,7 @@ impl<A: OsCredentialAdapter> IpcServer<A> {
         }
         machine.apply(SessionEvent::Prepare {
             operation_id: OperationId::new(),
+            term: 0,
             plan: plan.clone(),
         })?;
         let hash = plan.canonical_hash();
@@ -422,11 +442,13 @@ impl<A: OsCredentialAdapter> IpcServer<A> {
             machine.apply(SessionEvent::Ready {
                 operation_id: OperationId::new(),
                 participant: participant.id,
+                term: 0,
                 plan_hash: hash,
             })?;
         }
         machine.apply(SessionEvent::Commit {
             operation_id: OperationId::new(),
+            term: 0,
             plan_hash: hash,
         })?;
         if machine.state() != SessionState::Active {

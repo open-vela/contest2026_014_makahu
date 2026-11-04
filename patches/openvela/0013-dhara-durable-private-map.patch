@@ -1,0 +1,310 @@
+diff --git a/drivers/mtd/dhara.c b/drivers/mtd/dhara.c
+--- a/drivers/mtd/dhara.c
++++ b/drivers/mtd/dhara.c
+@@ -29,6 +29,8 @@
+ #include <errno.h>
+ #include <debug.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include <nuttx/nuttx.h>
+ #include <nuttx/kmalloc.h>
++#include <nuttx/mutex.h>
+@@ -63,6 +65,7 @@
+ 
+   FAR struct mtd_dev_s *mtd;      /* Contained MTD interface */
+   struct mtd_geometry_s geo;      /* Device geometry */
++  dhara_sector_t       capacity; /* Logical sectors after Dhara reserve */
+   uint16_t              blkper;   /* R/W blocks per erase block */
+   uint16_t              refs;     /* Number of references */
+   bool                  unlinked; /* The driver has been unlinked */
+@@ -173,19 +176,22 @@
+ static int dhara_init_readcache(FAR dhara_dev_t *dev)
+ {
+   FAR dq_queue_t *q = &dev->readcache;
+-  int i = 0;
++  int i;
+ 
+   dq_init(q);
+ 
+-  do
++  for (i = 0; i < CONFIG_DHARA_READ_NCACHES; i++)
+     {
+       dev->readpage[i].page = DHARA_PAGE_NONE;
+       dev->readpage[i].buffer = kmm_malloc(dev->geo.blocksize);
++      if (dev->readpage[i].buffer == NULL)
++        {
++          return -ENOMEM;
++        }
+       dq_addfirst(&dev->readpage[i].node, q);
+     }
+-  while (dev->readpage[i++].buffer && i < CONFIG_DHARA_READ_NCACHES);
+-
+-  return i == CONFIG_DHARA_READ_NCACHES ? 0 : -ENOMEM;
++
++  return 0;
+ }
+ 
+ static void dhara_deinit_readcache(FAR dhara_dev_t *dev)
+@@ -356,6 +362,12 @@
+   dev = inode->i_private;
+ 
+   nxmutex_lock(&dev->lock);
++  if (start_sector < 0 || start_sector > dev->capacity ||
++      nsectors > dev->capacity - start_sector)
++    {
++      nxmutex_unlock(&dev->lock);
++      return -ENXIO;
++    }
+   while (nsectors-- > 0)
+     {
+       dhara_error_t err;
+@@ -400,6 +412,12 @@
+   dev = inode->i_private;
+ 
+   nxmutex_lock(&dev->lock);
++  if (start_sector < 0 || start_sector > dev->capacity ||
++      nsectors > dev->capacity - start_sector)
++    {
++      nxmutex_unlock(&dev->lock);
++      return -ENXIO;
++    }
+   while (nsectors-- > 0)
+     {
+       dhara_error_t err;
+@@ -444,7 +462,7 @@
+       geometry->geo_available    = true;
+       geometry->geo_mediachanged = false;
+       geometry->geo_writeenabled = true;
+-      geometry->geo_nsectors     = dev->geo.neraseblocks * dev->blkper;
++      geometry->geo_nsectors     = dev->capacity;
+       geometry->geo_sectorsize   = dev->geo.blocksize;
+ 
+       strcpy(geometry->geo_model, dev->geo.model);
+@@ -470,6 +488,49 @@
+ 
+   DEBUGASSERT(inode->i_private);
+   dev = inode->i_private;
++
++  if (cmd == MTDIOC_GEOMETRY)
++    {
++      FAR struct mtd_geometry_s *geo =
++        (FAR struct mtd_geometry_s *)((uintptr_t)arg);
++      if (geo == NULL)
++        {
++          return -EINVAL;
++        }
++
++      memset(geo, 0, sizeof(*geo));
++      geo->blocksize = dev->geo.blocksize;
++      geo->erasesize = dev->geo.blocksize;
++      geo->neraseblocks = dev->capacity;
++      strlcpy(geo->model, dev->geo.model, sizeof(geo->model));
++      return 0;
++    }
++
++  if (cmd == BIOC_FLUSH)
++    {
++      dhara_error_t err = DHARA_E_NONE;
++      nxmutex_lock(&dev->lock);
++      ret = dhara_map_sync(&dev->map, &err);
++      if (ret < 0)
++        {
++          ret = dhara_convert_result(err);
++          if (ret == 0)
++            {
++              ret = -EIO;
++            }
++        }
++      else
++        {
++          ret = MTD_IOCTL(dev->mtd, BIOC_FLUSH, 0);
++          if (ret == -ENOTTY)
++            {
++              ret = 0;
++            }
++        }
++
++      nxmutex_unlock(&dev->lock);
++      return ret;
++    }
+ 
+   /* No other block driver ioctl commands are not recognized by this
+    * driver.  Other possible MTD driver ioctl commands are passed through
+@@ -568,10 +629,10 @@
+   int ret;
+ 
+   ret = MTD_BWRITE(dev->mtd, p, 1, data);
+-  if (ret < 0)
++  if (ret != 1)
+     {
+       dhara_set_error(err, DHARA_E_BAD_BLOCK);
+-      return ret;
++      return ret < 0 ? ret : -EIO;
+     }
+ 
+   dhara_update_readcache(dev, p, data);
+@@ -619,20 +680,20 @@
+   ret = MTD_BREAD(dev->mtd, p, 1, cache->buffer);
+   if (ret == -EUCLEAN)
+     {
+-      ret = 0; /* Ignore the correctable ECC error */
+-    }
+-
+-  if (ret < 0)
++      ret = 1; /* One complete page with correctable ECC. */
++    }
++
++  if (ret != 1)
+     {
+       dhara_insert_readcache(dev, cache);
+       dhara_set_error(err, DHARA_E_ECC);
+-      return ret;
++      return ret < 0 ? ret : -EIO;
+     }
+ 
+   memcpy(data, cache->buffer + offset, length);
+   cache->page = p;
+   dhara_insert_readcache(dev, cache);
+-  return ret;
++  return 0;
+ }
+ 
+ int dhara_nand_copy(FAR const struct dhara_nand *n,
+@@ -676,8 +737,8 @@
+  *
+  ****************************************************************************/
+ 
+-int dhara_initialize_by_path(FAR const char *path,
+-                             FAR struct mtd_dev_s *mtd)
++static int dhara_create(FAR const char *path, FAR struct mtd_dev_s *mtd,
++                         bool allow_blank, mode_t mode)
+ {
+   FAR dhara_dev_t *dev;
+   int ret;
+@@ -719,9 +780,26 @@
+       goto err;
+     }
+ 
++  if (dev->geo.blocksize < 512 || dev->geo.blocksize > UINT32_MAX / 2 ||
++      (dev->geo.blocksize & (dev->geo.blocksize - 1)) != 0 ||
++      dev->geo.erasesize < dev->geo.blocksize ||
++      dev->geo.erasesize % dev->geo.blocksize != 0 ||
++      dev->geo.neraseblocks < 2 ||
++      dev->geo.erasesize / dev->geo.blocksize > UINT16_MAX)
++    {
++      ret = -EINVAL;
++      goto err;
++    }
++
+   /* Get the number of R/W blocks per erase block */
+ 
+   dev->blkper = dev->geo.erasesize / dev->geo.blocksize;
++  if ((dev->blkper & (dev->blkper - 1)) != 0 ||
++      dev->geo.neraseblocks > UINT32_MAX / dev->blkper)
++    {
++      ret = -EINVAL;
++      goto err;
++    }
+   DEBUGASSERT(dev->blkper * dev->geo.blocksize == dev->geo.erasesize);
+ 
+   /* Init dhara */
+@@ -747,13 +825,31 @@
+                  dev->pagebuf + dev->geo.blocksize,
+                  CONFIG_DHARA_GC_RATIO);
+ 
+-  dhara_map_resume(&dev->map, NULL);
++  dhara_error_t resume_error = DHARA_E_NONE;
++  ret = dhara_map_resume(&dev->map, &resume_error);
++  if (ret < 0 && !allow_blank)
++    {
++      ret = dhara_convert_result(resume_error);
++      if (ret == 0)
++        {
++          ret = -EIO;
++        }
++
++      goto err;
++    }
++
++  dev->capacity = dhara_map_capacity(&dev->map);
++  if (dev->capacity == 0)
++    {
++      ret = -ENOSPC;
++      goto err;
++    }
+ 
+   /* Inode private data is a reference to the
+    * DHARA_MTDBLOCK device structure
+    */
+ 
+-  ret = register_blockdriver(path, &g_dhara_bops, 0666, dev);
++  ret = register_blockdriver(path, &g_dhara_bops, mode, dev);
+   if (ret < 0)
+     {
+       ferr("register_blockdriver failed: %d\n", ret);
+@@ -770,6 +866,18 @@
+   return ret;
+ }
+ 
++int dhara_initialize_by_path(FAR const char *path,
++                             FAR struct mtd_dev_s *mtd)
++{
++  return dhara_create(path, mtd, true, 0666);
++}
++
++int dhara_initialize_by_path_ex(FAR const char *path,
++                                FAR struct mtd_dev_s *mtd, bool allow_blank)
++{
++  return dhara_create(path, mtd, allow_blank, 0600);
++}
++
+ /****************************************************************************
+  * Name: dhara_initialize
+  *
+diff --git a/include/nuttx/mtd/mtd.h b/include/nuttx/mtd/mtd.h
+--- a/include/nuttx/mtd/mtd.h
++++ b/include/nuttx/mtd/mtd.h
+@@ -865,6 +865,10 @@
+ #ifdef CONFIG_MTD_DHARA
+ int dhara_initialize_by_path(FAR const char *path,
+                              FAR struct mtd_dev_s *mtd);
++/* Strict recovery when allow_blank is false. True is for explicit initial
++ * provisioning only, after the caller has verified erased media. */
++int dhara_initialize_by_path_ex(FAR const char *path,
++                                FAR struct mtd_dev_s *mtd, bool allow_blank);
+ #endif
+ 
+ /****************************************************************************
+diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
+--- a/drivers/mtd/Kconfig
++++ b/drivers/mtd/Kconfig
+@@ -1492,6 +1492,7 @@
+ config DHARA_READ_NCACHES
+ 	int "dhara read cache numbers"
+ 	default 4
++	range 1 16
+ endif
+ 
+ config MTD_CFI
+diff --git a/fs/littlefs/lfs_vfs.c b/fs/littlefs/lfs_vfs.c
+--- a/fs/littlefs/lfs_vfs.c
++++ b/fs/littlefs/lfs_vfs.c
+@@ -1165,7 +1165,7 @@
+ #ifdef CONFIG_FS_LITTLEFS_DEBUG
+   littlefs_check(drv, block, size, buffer, geo);
+ #endif
+-  return ret >= 0 ? OK : ret;
++  return ret < 0 ? ret : ret == size ? OK : -EIO;
+ }
+ 
+ /****************************************************************************
+@@ -1201,7 +1201,7 @@
+ #ifdef CONFIG_FS_LITTLEFS_DEBUG
+   littlefs_check(drv, block, size, buffer, geo);
+ #endif
+-  return ret >= 0 ? OK : ret;
++  return ret < 0 ? ret : ret == size ? OK : -EIO;
+ }
+ 
+ /****************************************************************************

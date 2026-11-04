@@ -1,8 +1,9 @@
 """Production request reader rejects slow, incomplete and oversized input."""
+from host_support import PROJECT_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root/'app/buffer_app/buffer_pairing.c').read_text()
 start = source.index('static int buffer_pairing_read_line(')
 end = source.index('static bool buffer_pairing_request_is(', start)
@@ -61,5 +62,5 @@ int main(void)
 with tempfile.TemporaryDirectory(prefix='buffer-pairing-read-') as temporary:
     work = Path(temporary)
     (work/'test.c').write_text(harness)
-    subprocess.run(['cc','-Wall','-Wextra','-Werror','-pthread',str(work/'test.c'),'-o',str(work/'test')],check=True)
+    subprocess.run([*CC,'-Wall','-Wextra','-Werror','-pthread',str(work/'test.c'),'-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],check=True,timeout=10)

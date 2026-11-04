@@ -1,0 +1,24 @@
+diff --git a/service/stacks/zephyr/hci_h4.c b/service/stacks/zephyr/hci_h4.c
+index 9206c0c4..3e453183 100644
+--- a/service/stacks/zephyr/hci_h4.c
++++ b/service/stacks/zephyr/hci_h4.c
+@@ -296,10 +296,17 @@ int bt_sal_hci_transport_init(const bt_vhal_interface* vhal)
+ 
+ void bt_sal_hci_transport_cleanup(void)
+ {
++    /* Initialization can fail before the HCI device is available. */
++    if (bt_dev == NULL || bt_dev->data == NULL) {
++        return;
++    }
++
+     struct h4_data* h4 = bt_dev->data;
+ 
+-    close(h4->fd);
+-    h4->fd = -1;
++    if (h4->fd >= 0) {
++        close(h4->fd);
++        h4->fd = -1;
++    }
+ }
+ 
+ static void hci_remove_recv(void* data)

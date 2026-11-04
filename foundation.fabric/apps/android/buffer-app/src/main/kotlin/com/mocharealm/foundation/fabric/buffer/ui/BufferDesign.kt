@@ -67,7 +67,7 @@ internal fun BufferActionRow(title: String, subtitle: String, icon: ImageVector,
             Icon(icon, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(22.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(title, style = MaterialTheme.typography.titleSmall)
-                Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (subtitle.isNotBlank()) Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Icon(BufferIcons.Next, null, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -96,12 +96,12 @@ internal fun BufferCardPreview(card: BufferCard, state: String, onClick: () -> U
                 Icon(if (card.kind == "question_card") BufferIcons.Search else BufferIcons.Leaf, null,
                     modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                 Text(state, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                if (!card.classificationConfirmed && card.state != "pending_transcription") Text("· 待确认分类", style = MaterialTheme.typography.labelMedium,
+                if (!card.classificationConfirmed && card.state !in setOf("pending_transcription", "source_unavailable")) Text("· 待确认分类", style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text(if (card.state == "pending_transcription") "一段语音记录" else card.title,
                 style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            if (card.summary != card.title) Text(if (card.state == "pending_transcription") "声音已经收好，等待整理成文字。" else card.summary, style = MaterialTheme.typography.bodyMedium,
+            if (card.summary != card.title) Text(if (card.state == "pending_transcription") "录音已保存，等待转写。" else card.summary, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
     }

@@ -1,13 +1,14 @@
 use super::{
     AppAttestationRequest, AppAttestationResponse, BarrierAbort, BarrierCommit, BarrierPrepare,
     BarrierReady, BarrierReject, ClockProbe, ClockReply, ClockStatus, ControlFrame,
-    ControlStreamHello, E2eeKeyAccept, E2eeKeyOffer, GroupKeyRotate, HubHello, LinkReady,
-    OfferRemove, OfferUpsert, PairingChallenge, PairingComplete, PairingConfirm, PairingStart,
-    PolicyDenied, ProtocolError, RegistryAck, RegistryResyncRequest, RegistrySnapshotBegin,
-    RegistrySnapshotEnd, SessionAbort, SessionAccept, SessionClose, SessionCommit,
-    SessionCounterOffer, SessionNotReady, SessionPrepare, SessionPropose, SessionReady,
-    SessionReconfigureAccept, SessionReconfigureCommit, SessionReconfigurePropose, SessionReject,
-    SessionResume, SessionSuspend, StreamOpen, wire,
+    ControlStreamHello, CoordinatorElectionCertificate, CoordinatorElectionHeartbeat,
+    CoordinatorElectionRequest, CoordinatorElectionVote, E2eeKeyAccept, E2eeKeyOffer,
+    GroupKeyRotate, HubHello, LinkReady, OfferRemove, OfferUpsert, PairingChallenge,
+    PairingComplete, PairingConfirm, PairingStart, PolicyDenied, ProtocolError, RegistryAck,
+    RegistryResyncRequest, RegistrySnapshotBegin, RegistrySnapshotEnd, SessionAbort, SessionAccept,
+    SessionClose, SessionCommit, SessionCounterOffer, SessionNotReady, SessionPrepare,
+    SessionPropose, SessionReady, SessionReconfigureAccept, SessionReconfigureCommit,
+    SessionReconfigurePropose, SessionReject, SessionResume, SessionSuspend, StreamOpen, wire,
 };
 use crate::{EpochPolicy, MESSAGE_NONCE_BYTES, SessionControlHeader};
 use fabric_core::OperationId;
@@ -40,6 +41,10 @@ pub enum ControlMessage {
     SessionReconfigureAccept(SessionReconfigureAccept),
     SessionReconfigureCommit(SessionReconfigureCommit),
     SessionClose(SessionClose),
+    CoordinatorElectionRequest(CoordinatorElectionRequest),
+    CoordinatorElectionVote(CoordinatorElectionVote),
+    CoordinatorElectionCertificate(CoordinatorElectionCertificate),
+    CoordinatorElectionHeartbeat(CoordinatorElectionHeartbeat),
     ClockProbe(ClockProbe),
     ClockReply(ClockReply),
     ClockStatus(ClockStatus),
@@ -199,6 +204,30 @@ impl ControlMessage {
             wire::MessageType::SessionClose => {
                 decode_variant!(frame, wire::SessionClose, SessionClose, Self::SessionClose)
             }
+            wire::MessageType::CoordinatorElectionRequest => decode_variant!(
+                frame,
+                wire::CoordinatorElectionRequest,
+                CoordinatorElectionRequest,
+                Self::CoordinatorElectionRequest
+            ),
+            wire::MessageType::CoordinatorElectionVote => decode_variant!(
+                frame,
+                wire::CoordinatorElectionVote,
+                CoordinatorElectionVote,
+                Self::CoordinatorElectionVote
+            ),
+            wire::MessageType::CoordinatorElectionCertificate => decode_variant!(
+                frame,
+                wire::CoordinatorElectionCertificate,
+                CoordinatorElectionCertificate,
+                Self::CoordinatorElectionCertificate
+            ),
+            wire::MessageType::CoordinatorElectionHeartbeat => decode_variant!(
+                frame,
+                wire::CoordinatorElectionHeartbeat,
+                CoordinatorElectionHeartbeat,
+                Self::CoordinatorElectionHeartbeat
+            ),
             wire::MessageType::ClockProbe => {
                 decode_variant!(frame, wire::ClockProbe, ClockProbe, Self::ClockProbe)
             }
@@ -313,12 +342,16 @@ impl ControlMessage {
             }
             Self::SessionAccept(value) => ingress!(value, SessionAccept, EpochPolicy::Exact),
             Self::SessionReject(value) => ingress!(value, SessionReject, EpochPolicy::Exact),
-            Self::SessionPrepare(value) => ingress!(value, SessionPrepare, EpochPolicy::Next),
-            Self::SessionReady(value) => ingress!(value, SessionReady, EpochPolicy::Next),
-            Self::SessionNotReady(value) => {
-                ingress!(value, SessionNotReady, EpochPolicy::Next)
+            Self::SessionPrepare(value) => {
+                ingress!(value, SessionPrepare, EpochPolicy::CurrentOrNext)
             }
-            Self::SessionCommit(value) => ingress!(value, SessionCommit, EpochPolicy::Next),
+            Self::SessionReady(value) => ingress!(value, SessionReady, EpochPolicy::CurrentOrNext),
+            Self::SessionNotReady(value) => {
+                ingress!(value, SessionNotReady, EpochPolicy::CurrentOrNext)
+            }
+            Self::SessionCommit(value) => {
+                ingress!(value, SessionCommit, EpochPolicy::CurrentOrNext)
+            }
             Self::SessionAbort(value) => ingress!(value, SessionAbort, EpochPolicy::Exact),
             Self::SessionSuspend(value) => ingress!(value, SessionSuspend, EpochPolicy::Exact),
             Self::SessionResume(value) => ingress!(value, SessionResume, EpochPolicy::Exact),
@@ -332,6 +365,22 @@ impl ControlMessage {
                 ingress!(value, SessionReconfigureCommit, EpochPolicy::Next)
             }
             Self::SessionClose(value) => ingress!(value, SessionClose, EpochPolicy::Exact),
+            Self::CoordinatorElectionRequest(value) => {
+                ingress!(value, CoordinatorElectionRequest, EpochPolicy::Exact)
+            }
+            Self::CoordinatorElectionVote(value) => {
+                ingress!(value, CoordinatorElectionVote, EpochPolicy::Exact)
+            }
+            Self::CoordinatorElectionCertificate(value) => {
+                ingress!(
+                    value,
+                    CoordinatorElectionCertificate,
+                    EpochPolicy::CurrentOrNext
+                )
+            }
+            Self::CoordinatorElectionHeartbeat(value) => {
+                ingress!(value, CoordinatorElectionHeartbeat, EpochPolicy::Exact)
+            }
             _ => None,
         }
     }
@@ -399,5 +448,42 @@ mod tests {
         let retry = message(2, OperationId::new()).session_ingress().unwrap();
         assert_eq!(first.semantic_payload, retry.semantic_payload);
         assert_eq!(first.epoch_policy, EpochPolicy::Exact);
+    }
+
+    #[test]
+    fn coordinator_election_controls_dispatch_and_bind_term_to_session_epoch() {
+        let message = CoordinatorElectionRequest {
+            header: SessionControlHeader {
+                operation_id: OperationId::new(),
+                session_id: SessionId::new(),
+                expected_epoch: 7,
+                sender_device_id: DeviceId([9; 32]),
+                message_nonce: [8; MESSAGE_NONCE_BYTES],
+            },
+            term: 12,
+            membership_hash: [1; 32],
+            committed_epoch: 7,
+            committed_plan_hash: [2; 32],
+            candidate: fabric_core::ParticipantId::new(),
+            candidate_device: DeviceId([9; 32]),
+            candidate_public_key: [3; 32],
+            signature: [4; DEVICE_PROOF_BYTES],
+        };
+        let frame = ControlFrame::new(
+            wire::MessageType::CoordinatorElectionRequest,
+            1,
+            &wire::CoordinatorElectionRequest::from(&message),
+        )
+        .unwrap();
+        let decoded = ControlMessage::decode(&frame).unwrap();
+        assert_eq!(decoded, ControlMessage::CoordinatorElectionRequest(message));
+
+        let ingress = decoded.session_ingress().unwrap();
+        assert_eq!(ingress.epoch_policy, EpochPolicy::Exact);
+        let semantic =
+            wire::CoordinatorElectionRequest::decode(ingress.semantic_payload.as_slice()).unwrap();
+        assert_eq!(semantic.term, 12);
+        assert_eq!(semantic.committed_epoch, 7);
+        assert_eq!(semantic.committed_plan_hash, [2; 32]);
     }
 }

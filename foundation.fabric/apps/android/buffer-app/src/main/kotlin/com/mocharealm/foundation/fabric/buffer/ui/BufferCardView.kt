@@ -74,15 +74,15 @@ internal fun CardView(
                 maxLines = if (expanded) Int.MAX_VALUE else 3, overflow = TextOverflow.Ellipsis)
             }
             if (!detail) TextButton(onClick = { expanded = !expanded }) {
-                Text(if (expanded) "收起详情" else "查看与处理")
+                Text(if (expanded) "收起详情" else "查看详情")
             }
             if (expanded) {
                 if (!card.classificationConfirmed) {
                     Text(
                         if (card.kind == ClassificationReview.UNCLASSIFIED) {
-                            "已拒绝分类 · 原始内容保留，可重新编辑分类"
+                            "已拒绝分类，可重新编辑；原文保留"
                         } else {
-                            "分类提案 · 可接受、编辑或拒绝，确认前不会写入日历或健康数据"
+                            "待确认分类；确认前不写入日历或健康数据"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.tertiary,
@@ -107,7 +107,6 @@ internal fun CardView(
                             else card.tags + BedtimeDeck.SAFE_TAG
                         onTags(card, tags.joinToString(","))
                     }) { Text(if (bedtimeSafe) "取消睡前可读" else "标为睡前可读") }
-                    Text("睡前只展示短内容；长篇研究、待办和深挖候选留到白天。", style = MaterialTheme.typography.bodySmall)
                 }
                 if (card.kind == "spark_card") {
                     if (card.tags.isNotEmpty()) {
@@ -210,7 +209,7 @@ internal fun CardView(
                     ) { Text("关联链接") }
                     val relatedCards = associationCandidates.filter { it.cardId in card.relatedCardIds }
                     if (relatedCards.isNotEmpty()) {
-                        Text("关联的 Spark / 生活事件", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+                        Text("关联灵感与生活记录", fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
                         relatedCards.forEach { related ->
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -236,7 +235,7 @@ internal fun CardView(
                             value = relatedSearch,
                             onValueChange = { relatedSearch = it },
                             modifier = Modifier.fillMaxWidth(),
-                            label = { Text("关联 Spark 或生活事件") },
+                            label = { Text("关联灵感或生活记录") },
                             singleLine = true,
                         )
                         associationCandidates

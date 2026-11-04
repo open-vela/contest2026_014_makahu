@@ -1,0 +1,3 @@
+# Preserve patch context and pinned upstream source formatting.
+patches/openvela/*.patch -whitespace
+app/buffer_app/third_party/libical/** -whitespace

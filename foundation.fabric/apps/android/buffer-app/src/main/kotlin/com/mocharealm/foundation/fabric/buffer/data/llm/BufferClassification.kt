@@ -1,9 +1,15 @@
 package com.mocharealm.foundation.fabric.buffer.data.llm
 import com.mocharealm.foundation.fabric.buffer.data.local.BufferRepository
+import com.mocharealm.foundation.fabric.buffer.data.device.VelaAssistantHandoff
+import com.mocharealm.foundation.fabric.buffer.data.coordinator.BufferCoordinatorJobGate
+import com.mocharealm.foundation.fabric.buffer.data.coordinator.BufferCoordinatorJobLease
+import com.mocharealm.foundation.fabric.buffer.data.coordinator.CoordinatorCapability
 import com.mocharealm.foundation.fabric.buffer.domain.LifeLogCategories
+import com.mocharealm.foundation.fabric.buffer.domain.BedtimeAssessment
 import com.mocharealm.foundation.fabric.buffer.domain.takeCodePoints
 import com.mocharealm.foundation.fabric.buffer.domain.model.BufferCapture
 import android.util.Log
+import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -25,6 +31,7 @@ data class BufferClassificationProposal(
     val confidence: Double,
     val relatedCardIds: List<String> = emptyList(),
     val presentation: String? = null,
+    val bedtime: String? = null,
 )
 
 /**
@@ -52,15 +59,70 @@ class BufferClassificationWorker(
     private fun process() {
         try {
             val config = repository.llmConfig()
-            if (!config.ready) return
-            for (job in repository.pendingClassificationJobs()) {
-                val lease = repository.claimClassificationRequest(job.captureId) ?: continue
+            for (job in repository.pendingClassificationJobs(eligible = {
+                !repository.meshManagesLocalClassification(it.captureId) && (config.ready || repository.assistantDispositionPending(it.captureId))
+            })) {
+                val capture = repository.findCapture(job.captureId) ?: continue
+                val needsCoordinatorFence = BufferCoordinatorJobGate.requiresFence(capture.sourceDevice)
+                val coordinatorLease = if (needsCoordinatorFence) {
+                    BufferCoordinatorJobGate.acquire(
+                        captureId = job.captureId,
+                        sourceDeviceId = capture.sourceDevice,
+                        stage = "classify",
+                        inputRevision = capture.createdAt,
+                        capability = CoordinatorCapability.CLASSIFY,
+                        nowElapsedRealtimeMillis = SystemClock.elapsedRealtime(),
+                    ) ?: continue
+                } else null
                 try {
-                    val proposals = BufferCaptureAgent.classify(config, job, repository, lease)
-                    repository.applyRemoteClassification(job.captureId, proposals, lease)
-                } catch (error: Exception) {
-                    repository.markClassificationRequestFailed(job.captureId, lease,
-                        error.message ?: "分类服务不可用")
+                    val requestLease = repository.claimClassificationRequest(job.captureId, expectedTranscript = job.transcript) ?: continue
+                    try {
+                        val assistantInput = if (coordinatorLease != null)
+                            repository.velaAssistantInput(job.captureId, requestLease) else null
+                        val handoff: (() -> Unit)? = if (assistantInput != null && coordinatorLease != null) ({
+                            repository.selectAssistantHandoff(job.captureId, requestLease)
+                            VelaAssistantHandoff.route(assistantInput) {
+                                BufferCoordinatorJobGate.termIfCurrent(coordinatorLease) { SystemClock.elapsedRealtime() }
+                            }
+                        }) else null
+                        val proposals = if (repository.assistantHandoffSelected(job.captureId, requestLease)) {
+                            requireNotNull(handoff).invoke()
+                            emptyList()
+                        } else BufferCaptureAgent.classifyAuthorized(config, job, repository, requestLease, authorize = {
+                            coordinatorLease == null || BufferCoordinatorJobGate.termIfCurrent(coordinatorLease) { SystemClock.elapsedRealtime() } != null
+                        }, assistantHandoff = handoff)
+                        if (coordinatorLease == null) {
+                            repository.applyRemoteClassification(job.captureId, proposals, requestLease, expectedTranscript = job.transcript)
+                        } else {
+                            commitVelaClassificationIfCurrent(
+                                repository = repository,
+                                captureId = job.captureId,
+                                requestLease = requestLease,
+                                coordinatorLease = coordinatorLease,
+                            ) {
+                                if (proposals.isEmpty()) repository.applyAssistantHandoff(job.captureId, requestLease)
+                                else repository.applyRemoteClassification(job.captureId, proposals, requestLease, expectedTranscript = job.transcript)
+                            }
+                        }
+                    } catch (error: Exception) {
+                        val markFailed = {
+                            repository.markClassificationRequestFailed(
+                                job.captureId,
+                                requestLease,
+                                error.message ?: "分类服务不可用",
+                            )
+                        }
+                        if (coordinatorLease == null) markFailed()
+                        else commitVelaClassificationIfCurrent(
+                            repository = repository,
+                            captureId = job.captureId,
+                            requestLease = requestLease,
+                            coordinatorLease = coordinatorLease,
+                            commit = markFailed,
+                        )
+                    }
+                } finally {
+                    coordinatorLease?.let(BufferCoordinatorJobGate::release)
                 }
             }
         } catch (error: Exception) {
@@ -68,6 +130,27 @@ class BufferClassificationWorker(
             Log.w("BufferClassification", "Classification pass failed; will retry", error)
         }
     }
+}
+
+/** Commit under the current Vela coordinator fence, or release our DB request lease for retry. */
+internal fun commitVelaClassificationIfCurrent(
+    repository: BufferRepository,
+    captureId: String,
+    requestLease: String,
+    coordinatorLease: BufferCoordinatorJobLease,
+    commit: () -> Unit,
+): Boolean {
+    // Repository methods synchronize on this same object. Taking it first keeps the
+    // lock order Repository -> Gate -> election -> DB and prevents reverse acquisition.
+    val committed = synchronized(repository) {
+        BufferCoordinatorJobGate.commitIfCurrent(
+            coordinatorLease,
+            SystemClock.elapsedRealtime(),
+            commit,
+        )
+    }
+    if (committed == null) repository.releaseClassificationRequest(captureId, requestLease)
+    return committed != null
 }
 
 internal object BufferClassificationParser {
@@ -130,6 +213,8 @@ internal object BufferClassificationParser {
                         summary = summary,
                         healthCategory = healthCategory,
                         confidence = confidence,
+                        bedtime = if (!segment.has("bedtime") || segment.isNull("bedtime")) null
+                            else BedtimeAssessment.parse(segment.getJSONObject("bedtime")).json().toString(),
                     ),
                 )
             }

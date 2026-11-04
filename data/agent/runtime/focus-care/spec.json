@@ -1,0 +1,1 @@
+{"id":"focus-care","version":1,"prompt_sha256":"37d34ff3d19022ac33f70f56628008f8286328bbbe8f4ee9e7037610bf75a6c8","reads":["focus_sessions"],"triggers":["focus_elapsed"],"actions":["notify_care"],"tools":[]}

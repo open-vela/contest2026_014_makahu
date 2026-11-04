@@ -1,0 +1,35 @@
+diff --git a/lfs.c b/lfs.c
+index 40bc63c..8b9dfda 100644
+--- a/lfs.c
++++ b/lfs.c
+@@ -3804,8 +3804,20 @@ static lfs_ssize_t lfs_dir_rawpath(lfs_t *lfs,
+     lfs_stag_t tag;
+     int err;
+ 
+-    if (lfs_pair_cmp(lfs->root, dir->pair) != 0) {
+-        tag = lfs_fs_parent(lfs, dir->pair, &parent);
++    // A split directory's continuation pair has no parent name entry.
++    // Locate its head before resolving the parent; keep the original pair
++    // and id below to look up this file's own name.
++    lfs_mdir_t head = *dir;
++    while (lfs_pair_cmp(lfs->root, head.pair) != 0) {
++        tag = lfs_fs_parent(lfs, head.pair, &parent);
++        if (tag == LFS_ERR_NOENT) {
++            lfs_mdir_t predecessor;
++            err = lfs_fs_pred(lfs, head.pair, &predecessor);
++            if (err) return err;
++            if (!predecessor.split) return LFS_ERR_NOENT;
++            head = predecessor;
++            continue;
++        }
+         if (tag < 0) {
+             return tag;
+         }
+@@ -3817,6 +3829,7 @@ static lfs_ssize_t lfs_dir_rawpath(lfs_t *lfs,
+ 
+         next += len;
+         size -= len;
++        break;
+     }
+ 
+     err = lfs_dir_getinfo(lfs, dir, id, &info);

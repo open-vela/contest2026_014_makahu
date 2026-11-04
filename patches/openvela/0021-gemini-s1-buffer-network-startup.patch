@@ -1,0 +1,23 @@
+diff --git a/boards/r528/r528s3-gemini-s1/src/etc/init.d/rcS.nsh b/boards/r528/r528s3-gemini-s1/src/etc/init.d/rcS.nsh
+--- a/boards/r528/r528s3-gemini-s1/src/etc/init.d/rcS.nsh
++++ b/boards/r528/r528s3-gemini-s1/src/etc/init.d/rcS.nsh
+@@ -79,14 +79,18 @@
+ #endif
+ #endif
+ 
+-#ifdef CONFIG_SYSTEM_NTPC
++#if defined(CONFIG_SYSTEM_NTPC) && !defined(CONFIG_LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP)
+ ntpcstart &
+ #endif
+ 
++/* Buffer restores its private WAPI profile in its network worker. The
++ * factory shell script uses unsupported shell expansions and another path. */
++#ifndef CONFIG_LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
+ if [ -f /data/etc/wifi/wapi.conf ]
+ then
+   sh /etc/wifi/start_wifi.sh &
+ fi
++#endif
+ 
+ #ifdef CONFIG_LVX_USE_DEMO_CONTEST2026_014_BUFFER_APP
+ buffer_app &

@@ -1,0 +1,58 @@
+diff --git a/fs/littlefs/lfs_vfs.c b/fs/littlefs/lfs_vfs.c
+index da587a0aee3..fe7d983f807 100644
+--- a/fs/littlefs/lfs_vfs.c
++++ b/fs/littlefs/lfs_vfs.c
+@@ -764,19 +764,21 @@ static int littlefs_fstat(FAR const struct file *filep, FAR struct stat *buf)
+       return -ENOMEM;
+     }
+ 
+-  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
+-                                              PATH_MAX));
++  /* Path reconstruction reads directory metadata and the open-file list.
++   * Hold the same lock used by rename, create and attribute updates. */
++
++  ret = nxmutex_lock(&fs->lock);
+   if (ret < 0)
+     {
+       lib_put_tempbuffer(path);
+       return ret;
+     }
+ 
+-  ret = nxmutex_lock(&fs->lock);
++  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
++                                              PATH_MAX));
+   if (ret < 0)
+     {
+-      lib_put_tempbuffer(path);
+-      return ret;
++      goto errout;
+     }
+ 
+   buf->st_size = lfs_file_size(&fs->lfs, &priv->file);
+@@ -844,19 +846,21 @@ static int littlefs_fchstat(FAR const struct file *filep,
+ 
+   /* Call LFS to get file size */
+ 
+-  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
+-                                              PATH_MAX));
++  /* Path reconstruction reads directory metadata and the open-file list.
++   * Hold the same lock used by rename, create and attribute updates. */
++
++  ret = nxmutex_lock(&fs->lock);
+   if (ret < 0)
+     {
+       lib_put_tempbuffer(path);
+       return ret;
+     }
+ 
+-  ret = nxmutex_lock(&fs->lock);
++  ret = littlefs_convert_result(lfs_file_path(&fs->lfs, &priv->file, path,
++                                              PATH_MAX));
+   if (ret < 0)
+     {
+-      lib_put_tempbuffer(path);
+-      return ret;
++      goto errout;
+     }
+ 
+   ret = littlefs_convert_result(lfs_getattr(&fs->lfs, path, 0, &attr,

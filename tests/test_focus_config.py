@@ -1,12 +1,13 @@
 """Exercise production focus payload parsing and revision-based timer updates."""
+from host_support import PROJECT_ROOT, SDK_ROOT, extract_c, CC, focus_legacy_helpers
 from pathlib import Path
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 main = (root / 'app/buffer_app/buffer_app_main.c').read_text()
 wire = (root / 'app/buffer_app/buffer_wire.c').read_text()
-cjson = root.parent / 'apps/netutils/cjson/cJSON'
+cjson = SDK_ROOT / 'apps/netutils/cjson/cJSON'
 
 
 def section(source, start, end):
@@ -31,9 +32,9 @@ int buffer_store_save_focus_interval(uint32_t interval)
   writes++;
   return storage_error;
 }
-''' + section(main, 'int buffer_sync_focus_config(', '/* Called with the runtime lock held. */') + section(
+''' + focus_legacy_helpers() + section(main, 'int buffer_sync_focus_config(', '/* Called with the runtime lock held. */') + section(
     wire, 'static bool buffer_wire_valid_device_id(', 'static void buffer_wire_load_standalone_state('
-) + section(wire, 'static int buffer_parse_focus_config(', 'static int buffer_apply_cards(') + r'''
+) + extract_c(wire, 'static int buffer_parse_focus_config(') + r'''
 int main(void)
 {
   struct buffer_focus_config_s config;
@@ -68,10 +69,12 @@ int main(void)
   strcpy(config.revision, "focus-conflict");
   config.remaining_ms = 100;
   g_buffer.mode_dirty = true;
-  assert(buffer_sync_focus_config(&config) == 0 && g_buffer.next_care_at == now);
+  assert(buffer_sync_focus_config(&config) == -EAGAIN && g_buffer.next_care_at == now);
+  assert(strcmp(g_buffer.focus_revision, "focus-defer") == 0);
   g_buffer.mode_dirty = false;
   strcpy(g_buffer.mode, "normal");
-  assert(buffer_sync_focus_config(&config) == 0 && g_buffer.next_care_at == now);
+  assert(buffer_sync_focus_config(&config) == -EAGAIN && g_buffer.next_care_at == now);
+  assert(strcmp(g_buffer.focus_revision, "focus-defer") == 0);
   config.interval_ms = 1;
   assert(buffer_sync_focus_config(&config) == -EINVAL);
   assert(buffer_sync_focus_config(NULL) == -EINVAL);
@@ -124,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='buffer-focus-config-') as temporary:
     (work / 'nuttx').mkdir()
     (work / 'nuttx/config.h').write_text('')
     (work / 'test.c').write_text(harness)
-    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(work),
+    subprocess.run([*CC, '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(work),
                     '-I', str(root / 'app/buffer_app'), '-I', str(cjson),
                     str(work / 'test.c'), str(cjson / 'cJSON.c'), '-lm', '-o', str(work / 'test')], check=True)
     subprocess.run([str(work / 'test')], check=True, timeout=10)

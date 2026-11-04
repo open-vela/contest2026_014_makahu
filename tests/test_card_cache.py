@@ -1,12 +1,13 @@
 """Host fault-injection test of the production deck commit function."""
+from host_support import PROJECT_ROOT, CC
 from pathlib import Path
 import subprocess
 import tempfile
 
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 source = (root / "app/buffer_app/buffer_app_main.c").read_text()
 start = source.index("int buffer_update_cards(")
-end = source.index("\nvoid buffer_sync_remote_mode", start)
+end = source.index("\nint buffer_sync_remote_mode", start)
 with tempfile.TemporaryDirectory(prefix="buffer-cache-test-") as temporary:
     work = Path(temporary)
     (work / "nuttx").mkdir()
@@ -60,7 +61,7 @@ int main(void)
 }
 '''
     (work / "test.c").write_text(harness)
-    subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-pthread",
+    subprocess.run([*CC, "-Wall", "-Wextra", "-Werror", "-pthread",
                     "-I", str(work), "-I", str(root / "app/buffer_app"),
                     str(work / "test.c"), "-o", str(work / "test")], check=True)
     subprocess.run([str(work / "test")], check=True)

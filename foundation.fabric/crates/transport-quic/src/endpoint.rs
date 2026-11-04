@@ -111,6 +111,18 @@ impl QuicEndpoint {
         self.identity.device_id()
     }
 
+    /// The same authenticated identity used by the TLS certificate and
+    /// HubHello proof. Election signatures must use this identity, never an
+    /// application-supplied device identifier.
+    pub fn device_identity(&self) -> Arc<DeviceIdentity> {
+        Arc::clone(&self.identity)
+    }
+
+    /// The same trust authority used by the authenticated link handshake.
+    pub fn trust_store(&self) -> Arc<dyn DeviceTrustStore> {
+        Arc::clone(&self.trust_store)
+    }
+
     #[must_use]
     pub fn sign_device_proof(&self, transcript_hash: &[u8; 32]) -> [u8; 64] {
         self.identity.sign_device_proof(transcript_hash)

@@ -33,6 +33,10 @@ class BufferCareScheduler(
     private val notificationManager = appContext.getSystemService(NotificationManager::class.java)
     private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val lock = Any()
+    private val focusCalendar = BufferFocusCalendar(appContext, repository)
+    private val bedtimeCalendar = BufferBedtimeCalendar(appContext)
+    private val researchCalendar = BufferResearchCalendar(appContext, repository)
+    private val capabilityProcess = "process:${java.util.UUID.randomUUID()}"
 
     fun start() {
         createNotificationChannel()
@@ -45,18 +49,42 @@ class BufferCareScheduler(
             cancelAlarm()
             cancelBedtimeAlarm()
             cancelResearchAlarm()
+            val researchWeekly = researchWeeklyIntent(); alarmManager.cancel(researchWeekly); researchWeekly.cancel()
             cancelWeeklyAlarm()
             cancelReturnAlarm()
             cancelCardReminderAlarm()
+            val capability = capabilityIntent(); alarmManager.cancel(capability); capability.cancel()
+            focusCalendar.cancelAlarm()
+            bedtimeCalendar.close()
         }
     }
 
-    fun onAlarm() {
-        reconcile()
+    fun onAlarm(onComplete: (() -> Unit)? = null) {
+        requestReconcile(onComplete)
+    }
+
+    fun requestReconcile(onComplete: (() -> Unit)? = null) {
+        if (executor.isShutdown) { onComplete?.invoke(); return }
+        try {
+            executor.execute {
+                try { reconcile() }
+                finally { onComplete?.invoke() }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            onComplete?.invoke()
+        }
+    }
+
+    fun onCalendarStart(key: String) {
+        executor.execute {
+            runCatching { focusCalendar.start(key) }
+                .onFailure { Log.w("BufferCareScheduler", "Calendar focus start deferred", it) }
+            reconcile()
+        }
     }
 
     fun onBedtimeAlarm() {
-        reconcile()
+        requestReconcile()
     }
 
     fun onReminderAction(action: String) {
@@ -77,7 +105,7 @@ class BufferCareScheduler(
             } catch (error: Exception) {
                 Log.w("BufferCareScheduler", "Reminder action failed", error)
             }
-            reconcileBedtime(System.currentTimeMillis())
+            requestReconcile()
         }
     }
 
@@ -104,17 +132,65 @@ class BufferCareScheduler(
                 // An exception escaping a periodic Runnable suppresses later runs.
                 Log.w("BufferCareScheduler", "Focus reconciliation failed; will retry", error)
             }
+            try { focusCalendar.reconcile() }
+            catch (error: Exception) { Log.w("BufferCareScheduler", "Calendar focus will retry", error) }
             reconcileBedtime(System.currentTimeMillis())
             reconcileResearch(System.currentTimeMillis())
+            reconcileResearchWeekly(System.currentTimeMillis())
             reconcileWeekly(System.currentTimeMillis())
             reconcileReturns(System.currentTimeMillis())
             reconcileCardReminders(System.currentTimeMillis())
+            reconcileCapabilities()
         }
+    }
+
+    private fun capabilityIntent(): PendingIntent = PendingIntent.getBroadcast(appContext, 1422,
+        Intent(appContext, BufferCareAlarmReceiver::class.java).setAction(ACTION_CAPABILITY),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+    private fun reconcileCapabilities() {
+        val now = System.currentTimeMillis()
+        try {
+            val boot = runCatching { "boot:" + android.provider.Settings.Global.getInt(appContext.contentResolver,
+                android.provider.Settings.Global.BOOT_COUNT) }.getOrDefault(capabilityProcess)
+            val next = repository.reconcileCapabilities(now, SystemClock.elapsedRealtime(), boot, ::postCapability) { task ->
+                notificationManager.cancel("buffer-capability-$task", 1420)
+            }
+            val intent = capabilityIntent()
+            if (next == null) { alarmManager.cancel(intent); intent.cancel() }
+            else alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, next, intent)
+        } catch (error: Exception) {
+            Log.w("BufferCareScheduler", "Capability work deferred", error)
+            runCatching { alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, now + 60_000, capabilityIntent()) }
+        }
+    }
+
+    private fun postCapability(notice: com.mocharealm.foundation.fabric.buffer.domain.CapabilityNotice): Boolean {
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(appContext,
+                android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
+        val channel = "buffer-capabilities"
+        notificationManager.createNotificationChannel(NotificationChannel(channel, "Buffer 能力照顾", NotificationManager.IMPORTANCE_DEFAULT))
+        if (!notificationManager.areNotificationsEnabled() ||
+            notificationManager.getNotificationChannel(channel)?.importance == NotificationManager.IMPORTANCE_NONE) return false
+        val open = PendingIntent.getActivity(appContext, 1420,
+            Intent(appContext, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        return try {
+            notificationManager.notify("buffer-capability-${notice.taskId}", 1420,
+                Notification.Builder(appContext, channel).setSmallIcon(R.drawable.ms_info)
+                    .setContentTitle("专注后的照顾").setContentText(notice.message)
+                    .setStyle(Notification.BigTextStyle().bigText(notice.message))
+                    .setContentIntent(open).setAutoCancel(true).setOnlyAlertOnce(true)
+                    .setVisibility(Notification.VISIBILITY_PRIVATE).build())
+            true
+        } catch (_: Exception) { false }
     }
 
     private fun reconcileBedtime(now: Long) {
         try {
-            val next = repository.reconcileBedtime(now)
+            val policy = repository.bedtimePolicy()
+            val plan = if (policy.method == "calendar") bedtimeCalendar.resolve(policy, now) else null
+            val next = repository.reconcileBedtime(System.currentTimeMillis(), plan)
             if (next == null) cancelBedtimeAlarm() else scheduleBedtimeAlarmAt(next)
         } catch (error: Exception) {
             // Keep the periodic worker alive so transient storage/alarm errors retry.
@@ -153,7 +229,7 @@ class BufferCareScheduler(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return try {
             notificationManager.notify("buffer-card-${card.cardId}", 1410,
-                Notification.Builder(appContext, channelId).setSmallIcon(android.R.drawable.ic_dialog_info)
+                Notification.Builder(appContext, channelId).setSmallIcon(R.drawable.ms_info)
                     .setContentTitle(card.title.take(120)).setContentText(card.summary.take(240))
                     .setContentIntent(open).setAutoCancel(true).setOnlyAlertOnce(true)
                     .setVisibility(Notification.VISIBILITY_PRIVATE).build())
@@ -200,6 +276,53 @@ class BufferCareScheduler(
         } catch (error: Exception) { Log.w("BufferCareScheduler", "Research timer failed; will retry", error) }
     }
 
+    private fun researchWeeklyIntent(): PendingIntent = PendingIntent.getBroadcast(appContext, 1423,
+        Intent(appContext, BufferCareAlarmReceiver::class.java).setAction(ACTION_RESEARCH_WEEKLY),
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+    private fun reconcileResearchWeekly(now: Long) {
+        try {
+            researchCalendar.reconcile()
+            val next = repository.reconcileResearchWeekly(now, ::postResearchWeekly) {
+                notificationManager.cancel("research-weekly:$it", 1423)
+            }
+            val intent=researchWeeklyIntent()
+            if(next==null){alarmManager.cancel(intent);intent.cancel()}
+            else alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP,next,intent)
+        } catch (error: Exception) { Log.w("BufferCareScheduler","Research weekly plan deferred",error) }
+    }
+
+    private fun postResearchWeekly(plan: com.mocharealm.foundation.fabric.buffer.domain.ResearchWeeklyPlan): Boolean {
+        if(Build.VERSION.SDK_INT>=33 && ContextCompat.checkSelfPermission(appContext,android.Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED)return false
+        if(!notificationManager.areNotificationsEnabled())return false
+        val channel="buffer-research-weekly"
+        notificationManager.createNotificationChannel(NotificationChannel(channel,"每周研究预约",NotificationManager.IMPORTANCE_DEFAULT))
+        if(notificationManager.getNotificationChannel(channel)?.importance==NotificationManager.IMPORTANCE_NONE)return false
+        val start=PendingIntent.getBroadcast(appContext,0,Intent(appContext,BufferCareAlarmReceiver::class.java)
+            .setAction(ACTION_RESEARCH_WEEKLY_START).setData(android.net.Uri.parse("${plan.marker}/${plan.revision}/${plan.nextAt}"))
+            .putExtra("plan_id",plan.id).putExtra("plan_revision",plan.revision).putExtra("occurrence",plan.nextAt),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val open=PendingIntent.getActivity(appContext,0,Intent(appContext,MainActivity::class.java),PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        notificationManager.notify("research-weekly:${plan.id}",1423,Notification.Builder(appContext,channel)
+            .setSmallIcon(R.drawable.ms_alarm).setContentTitle(plan.title)
+            .setContentText("研究时间到了，确认后开始；本时段结束时停止计时")
+            .setContentIntent(open).setOnlyAlertOnce(true).setAutoCancel(false)
+            .addAction(Notification.Action.Builder(null,"开始研究",start).build()).build())
+        return true
+    }
+
+    fun onResearchWeeklyStart(id: String, revision: Long, occurrence: Long, complete: ()->Unit) {
+        if(executor.isShutdown){complete();return}
+        try { executor.execute {
+            try {
+                repository.startResearchWeekly(id,revision,occurrence)
+                notificationManager.cancel("research-weekly:$id",1423)
+                reconcile()
+            } catch(error: Exception){Log.w("BufferCareScheduler","Research appointment is no longer current",error)}
+            finally {complete()}
+        } } catch (_: java.util.concurrent.RejectedExecutionException){complete()}
+    }
+
     private fun postResearchNotice(session: RabbitHoleSession): Boolean {
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(appContext,
                 android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
@@ -212,7 +335,7 @@ class BufferCareScheduler(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         return try {
             notificationManager.notify("buffer-research", 1411,
-                Notification.Builder(appContext, channel).setSmallIcon(android.R.drawable.ic_dialog_info)
+                Notification.Builder(appContext, channel).setSmallIcon(R.drawable.ms_info)
                     .setContentTitle("研究时间到：${session.title.take(100)}")
                     .setContentText("打开 Buffer，记录这次发现；也可以稍后再写。")
                     .setContentIntent(open).setAutoCancel(true).setOnlyAlertOnce(true)
@@ -326,7 +449,7 @@ class BufferCareScheduler(
         val notification = Notification.Builder(appContext, CHANNEL_ID)
             .setContentTitle("专注照顾提醒")
             .setContentText("喝水、看远处或活动一下肩颈")
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(R.drawable.ms_info)
             .setContentIntent(contentIntent)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
@@ -357,6 +480,9 @@ class BufferCareScheduler(
 
     companion object {
         const val ACTION_CARD_REMINDER = "com.mocharealm.foundation.fabric.buffer.CARD_REMINDER"
+        const val ACTION_CAPABILITY = "com.mocharealm.foundation.fabric.buffer.CAPABILITY_ALARM"
+        const val ACTION_RESEARCH_WEEKLY = "com.mocharealm.foundation.fabric.buffer.RESEARCH_WEEKLY"
+        const val ACTION_RESEARCH_WEEKLY_START = "com.mocharealm.foundation.fabric.buffer.RESEARCH_WEEKLY_START"
         const val ACTION_RESEARCH = "com.mocharealm.foundation.fabric.buffer.RESEARCH_ALARM"
         const val ACTION_RETURN = "com.mocharealm.foundation.fabric.buffer.CARD_RETURN"
         const val ACTION_WEEKLY = "com.mocharealm.foundation.fabric.buffer.WEEKLY_ALARM"
@@ -379,6 +505,22 @@ class BufferCareAlarmReceiver : android.content.BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val application = context.applicationContext as? BufferApplication ?: return
         when (intent.action) {
+            BufferCareScheduler.ACTION_RESEARCH_WEEKLY_START -> {
+                val pending=goAsync()
+                application.careScheduler.onResearchWeeklyStart(intent.getStringExtra("plan_id").orEmpty(),
+                    intent.getLongExtra("plan_revision",0),intent.getLongExtra("occurrence",0)){pending.finish()}
+            }
+            BufferCareScheduler.ACTION_RESEARCH_WEEKLY -> {
+                val pending=goAsync();application.careScheduler.onAlarm { pending.finish() }
+            }
+            BufferCareScheduler.ACTION_CAPABILITY -> {
+                // Keep this broadcast alive until the durable notification
+                // decision finishes, including when the app was just started.
+                val pending = goAsync()
+                application.careScheduler.onAlarm { pending.finish() }
+            }
+            BufferFocusCalendar.ACTION_START -> application.careScheduler.onCalendarStart(intent.getStringExtra("focus_plan").orEmpty())
+            BufferFocusCalendar.ACTION_TICK -> application.careScheduler.onAlarm()
             BufferCareScheduler.ACTION_CARD_REMINDER,
             BufferCareScheduler.ACTION_RESEARCH,
             BufferCareScheduler.ACTION_RETURN,

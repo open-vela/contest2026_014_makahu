@@ -1,0 +1,92 @@
+/****************************************************************************
+ * Buffer Goldfish startup, derived from openvela Vela rc.sysinit
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.  The
+ * ASF licenses this file to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance with the
+ * License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ *
+ ****************************************************************************/
+
+#include <nuttx/config.h>
+
+set +e
+
+#ifdef CONFIG_LIBC_LOCALTIME
+set TZ Asia/Shanghai
+#endif
+
+#ifndef CONFIG_NSH_DISABLE_UNAME
+uname -a > /dev/log
+#endif
+
+#ifdef CONFIG_FS_PROCFS
+mount -t procfs /proc
+#endif
+
+#ifdef CONFIG_FS_BINFS
+mount -t binfs /bin
+#endif
+
+#ifdef CONFIG_FS_TMPFS
+mount -t tmpfs /tmp
+#endif
+
+#ifdef CONFIG_FS_HOSTFS
+mount -t hostfs -o fs=vendor/qemu/boards/vela/resource /host
+#endif
+
+#ifdef CONFIG_FS_ROMFS
+mount -t romfs /dev/virtblk0 /system
+#endif
+
+/* The dedicated optional third virtio disk is prepared OFFLINE with the SDK
+ * LittleFS generator. Never autoformat; a failed/private-disk-absent boot keeps
+ * the original FAT behavior and the Agent reports storage_unavailable. */
+#if defined(CONFIG_BUFFER_VELA_SIM_PRIVATE_DISK) && defined(CONFIG_FS_LITTLEFS)
+if [ -e /dev/virtblk2 ]
+then
+    mount -t littlefs /dev/virtblk2 /data
+fi
+#endif
+
+#ifdef CONFIG_FS_FATFS
+if [ ! -e /data ]
+then
+    mount -t fatfs /dev/virtblk1 /data
+fi
+if [ ! -e /data ]
+then
+    mount -t fatfs  /dev/virtblk0 /data
+fi
+#endif
+
+#ifdef CONFIG_FS_V9FS
+mount -t v9fs -o trans=virtio,tag=host /share
+#endif
+
+#if defined(CONFIG_FS_RPMSGFS) && defined(CONFIG_VELA_TEE)
+mount -t rpmsgfs -o cpu=ap,fs=/data /data
+#endif
+
+#if defined(CONFIG_FS_TMPFS) && !defined(CONFIG_VELA_TEE)
+if [ ! -e /data ]
+then
+    echo "not found /data, create tmpfs instead"
+    mount -t tmpfs /data
+fi
+#endif
+
+#ifndef CONFIG_NSH_DISABLE_TIMEDATECTL
+timedatectl set-timezone Asia/Shanghai
+#endif

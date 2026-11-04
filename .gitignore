@@ -21,3 +21,10 @@ signing.properties
 *.jks
 *.keystore
 /foundation.fabric/dist/
+
+.pytest_cache/
+
+# Local verification output and JVM crash diagnostics
+/.validation/
+hs_err_pid*.log
+replay_pid*.log

@@ -1,0 +1,26 @@
+diff --git a/drivers/mtd/dhara.c b/drivers/mtd/dhara.c
+--- a/drivers/mtd/dhara.c
++++ b/drivers/mtd/dhara.c
+@@ -824,6 +824,14 @@
+                  dev->pagebuf + dev->geo.blocksize,
+                  CONFIG_DHARA_GC_RATIO);
+ 
++  /* A filesystem records this geometry at format time.  Resume restores
++   * Dhara's learned bad-block estimate, which can increase map_capacity
++   * after a clean journal wrap.  Keep the conservative initial capacity
++   * as the block-device geometry across reboots; Dhara still enforces its
++   * current allocation limit when writing. */
++
++  dev->capacity = dhara_map_capacity(&dev->map);
++
+   dhara_error_t resume_error = DHARA_E_NONE;
+   ret = dhara_map_resume(&dev->map, &resume_error);
+   if (ret < 0 && !allow_blank)
+@@ -837,7 +845,6 @@
+       goto err;
+     }
+ 
+-  dev->capacity = dhara_map_capacity(&dev->map);
+   if (dev->capacity == 0)
+     {
+       ret = -ENOSPC;

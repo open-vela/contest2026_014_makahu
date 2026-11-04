@@ -14,6 +14,20 @@
 #include <stdint.h>
 #include <pthread.h>
 
+/* S1's 4 KiB pthread default cannot accommodate journal/JSON/filesystem
+ * call chains. Use this for workers without a larger explicit budget. */
+static inline int buffer_thread_create(pthread_t *thread,
+                                      void *(*entry)(void *), void *arg)
+{
+  pthread_attr_t attributes;
+  int ret = pthread_attr_init(&attributes);
+  if (ret != 0) return ret;
+  ret = pthread_attr_setstacksize(&attributes, 32 * 1024);
+  if (ret == 0) ret = pthread_create(thread, &attributes, entry, arg);
+  pthread_attr_destroy(&attributes);
+  return ret;
+}
+
 #define BUFFER_CARD_LIMIT 5
 #define BUFFER_ID_SIZE 80
 #define BUFFER_TEXT_SIZE 192
@@ -24,6 +38,21 @@
 #define BUFFER_CARD_ACTIONS_SIZE 128
 #define BUFFER_PAIRING_CODE_SIZE 7
 #define BUFFER_CARD_ACTION_BUTTONS 5
+
+enum buffer_capture_target_e
+{
+  BUFFER_CAPTURE_TARGET_AUTO = 0,
+  BUFFER_CAPTURE_TARGET_BUFFER,
+  BUFFER_CAPTURE_TARGET_ASSISTANT,
+};
+
+enum buffer_audio_phase_e
+{
+  BUFFER_AUDIO_IDLE, BUFFER_AUDIO_PREPARING, BUFFER_AUDIO_CAPTURING, BUFFER_AUDIO_SAVING
+};
+enum buffer_audio_phase_e buffer_audio_phase(void);
+
+#define BUFFER_CAPTURE_TARGET_NAME_SIZE 16
 
 #ifndef CONFIG_BUFFER_VELA_DATA_DIR
 #  define CONFIG_BUFFER_VELA_DATA_DIR "/data/buffer"
@@ -67,6 +96,13 @@ struct buffer_card_s
   char state[32];
   char actions[BUFFER_CARD_ACTIONS_SIZE];
   int64_t created_at;
+  uint64_t content_revision;
+  /* Bounded display projection, never an instruction to execute a job. */
+  int64_t schedule_start;
+  int64_t schedule_end;
+  int64_t hidden_until;
+  int64_t returned_at;
+  bool bedtime_readable;
 };
 
 #define BUFFER_FOCUS_INTERVAL_MIN_MS 300000u
@@ -92,6 +128,8 @@ struct buffer_research_s
   char reason[32];
 };
 
+enum buffer_voice_phase {BUFFER_VOICE_RECORDING,BUFFER_VOICE_CLOSING,BUFFER_VOICE_QUEUED,BUFFER_VOICE_ASR,BUFFER_VOICE_INTENT,BUFFER_VOICE_EXECUTING,BUFFER_VOICE_READY,BUFFER_VOICE_BUFFER_PENDING,BUFFER_VOICE_RETRY,BUFFER_VOICE_ERROR,BUFFER_VOICE_CANCELLED};
+struct buffer_voice_status {char id[BUFFER_ID_SIZE],transcript[1025];enum buffer_voice_phase phase;int error;};
 struct buffer_runtime_s
 {
   pthread_mutex_t lock;
@@ -101,6 +139,7 @@ struct buffer_runtime_s
   bool touch_requested;
   bool touch_released;
   volatile bool record_stop;
+  int record_decision; /* atomic: capture=0, cancelled=1, committing=2 */
   bool input_thread_started;
   bool sync_thread_started;
   bool record_thread_started;
@@ -118,7 +157,10 @@ struct buffer_runtime_s
   pthread_t pairing_thread;
   pthread_t timer_thread;
   char record_id[BUFFER_ID_SIZE];
+  struct buffer_voice_status voice;
   char record_mode[BUFFER_MODE_SIZE];
+  char record_context_card[BUFFER_ID_SIZE];
+  enum buffer_capture_target_e record_target;
   char pairing_code[BUFFER_PAIRING_CODE_SIZE];
   unsigned int pairing_failures;
   int64_t pairing_block_until;
@@ -135,7 +177,9 @@ struct buffer_runtime_s
   int64_t research_deadline;
   uint32_t focus_interval_ms;
   char focus_revision[BUFFER_ID_SIZE];
+  char focus_title[161];
   int64_t focus_started_at;
+  int64_t focus_elapsed_offset_ms;
   int64_t next_care_at;
   int64_t focus_reminder_until;
   struct buffer_card_s cards[BUFFER_CARD_LIMIT];
@@ -144,17 +188,44 @@ struct buffer_runtime_s
 
 extern struct buffer_runtime_s g_buffer;
 
+/* One coherent, memory-only presentation view. A busy persistence transaction
+ * must leave the last frame usable instead of parking the LVGL thread. */
+struct buffer_ui_runtime_s
+{
+  char status[BUFFER_STATUS_SIZE], mode[BUFFER_MODE_SIZE];
+  char pairing_code[BUFFER_PAIRING_CODE_SIZE], focus_title[161];
+  struct buffer_card_s cards[BUFFER_CARD_LIMIT];
+  int card_count, card_index, pending_count;
+  bool cards_stale, recording, phone_synced, mode_dirty, focus_reminder_due, action_requested;
+  struct buffer_research_s research;
+  int64_t research_deadline, focus_started_at, next_care_at;
+  uint32_t focus_interval_ms;
+};
+bool buffer_ui_runtime_snapshot(struct buffer_ui_runtime_s *out);
+/* Runs off the LVGL thread. On success the queue owns context and frees it
+ * after run returns; on error ownership remains with the caller. */
+int buffer_ui_work_submit(void (*run)(void *), void *context);
+
 int buffer_touch_record_start(void);
+int buffer_assistant_record_start(void);
+int buffer_touch_record_start_for_card(const char *card_id);
 void buffer_touch_record_stop(void);
+int buffer_touch_record_cancel(void);
 bool buffer_touch_record_active(void);
 
 void buffer_set_status(const char *format, ...);
 void buffer_request_sync(void);
 void buffer_request_action(const char *action);
+void buffer_request_card_action(const char *card_id, const char *action);
 void buffer_request_mode(const char *mode);
 void buffer_request_card_step(int delta);
 int buffer_update_cards(const struct buffer_card_s *cards, int count);
-void buffer_sync_remote_mode(const char *mode);
+int buffer_sync_remote_mode(const char *mode);
+int buffer_sync_remote_mode_ack(const char *mode, const char *mode_id);
+int buffer_wire_parse_runtime_state(const char *message, uint64_t *revision,
+                                    char *mode, size_t mode_size,
+                                    struct buffer_focus_config_s *focus,
+                                    struct buffer_research_s *research);
 void buffer_mark_cards_stale(void);
 bool buffer_cards_are_stale(void);
 bool buffer_card_supports_action(const struct buffer_card_s *card,
@@ -174,6 +245,14 @@ void buffer_ble_stop(void);
 int buffer_store_init(void);
 int buffer_store_load_focus_interval(uint32_t *interval);
 int buffer_store_save_focus_interval(uint32_t interval);
+int buffer_store_load_oobe_deferred(bool *deferred);
+int buffer_store_save_oobe_deferred(bool deferred);
+/* Completion is bound to the current Fabric local/peer identity pair. Missing
+ * or stale records leave completed false; all storage errors fail closed. */
+int buffer_store_load_oobe_completed(bool *completed);
+int buffer_store_save_oobe_completed(bool completed);
+bool buffer_store_oobe_completed_cached(void);
+void buffer_store_oobe_completion_invalidate(void);
 int buffer_sync_focus_config(const struct buffer_focus_config_s *config);
 int buffer_store_pending_count(void);
 int buffer_store_queue_limit_reached(void);
@@ -183,6 +262,13 @@ int buffer_store_read_audio(const char *capture_id,
 int buffer_store_read_metadata(const char *capture_id, int64_t *created_at,
                                uint32_t *duration_ms, char *mode,
                                size_t mode_size);
+/* Return the literal capture target. Metadata without a target is mapped to
+ * "buffer" for compatibility with older queued captures. */
+int buffer_store_capture_target(const char *capture_id, char *target,
+                                size_t target_size);
+/* Compatibility helper: 1 for assistant, 0 for buffer/auto/legacy, or a
+ * negative errno when metadata is malformed or unreadable. */
+int buffer_store_capture_is_assistant(const char *capture_id);
 int buffer_store_set_capture_state(const char *capture_id, const char *state);
 int buffer_store_ack(const char *capture_id);
 int buffer_store_save_enrollment(const char *host, const char *token,
@@ -208,18 +294,34 @@ int buffer_store_save_pending_action(const char *card_id,
 int buffer_store_load_pending_action(char *card_id, size_t card_id_size,
                                      char *action_id, size_t action_id_size,
                                      char *action, size_t action_size);
-void buffer_store_clear_pending_action(void);
+int buffer_store_clear_pending_action(void);
 int buffer_store_save_pending_mode(const char *mode, const char *mode_id);
 int buffer_store_load_pending_mode(char *mode, size_t mode_size,
                                    char *mode_id, size_t mode_id_size);
-void buffer_store_clear_pending_mode(void);
+int buffer_store_clear_pending_mode(void);
 int buffer_store_load_cards(struct buffer_card_s *cards, int max_cards);
 int buffer_store_save_cards(const struct buffer_card_s *cards, int count);
 
 int buffer_wifi_configure(const char *ssid, const char *passphrase);
 int buffer_wifi_reconnect(void);
+bool buffer_wifi_is_ready(void);
+void buffer_wifi_status(void);
+unsigned buffer_ui_heartbeat(void);
+void buffer_ui_progress(const char *stage);
+unsigned buffer_ui_progress_sequence(void);
+const char *buffer_ui_progress_stage(void);
+void buffer_ui_startup_show(void);
+void buffer_ui_home_command(int command);
+void buffer_ui_menu_command(int command);
+unsigned buffer_ui_menu_state(void);
+void buffer_ui_calendar_command(int command);
 
+int buffer_audio_record_cancelable(const char *capture_id, const char *mode,
+                        enum buffer_capture_target_e target,
+                        volatile bool *stop, uint32_t *duration_ms,
+                        int *decision);
 int buffer_audio_record(const char *capture_id, const char *mode,
+                        enum buffer_capture_target_e target,
                         volatile bool *stop, uint32_t *duration_ms);
 
 int buffer_wire_sync_once(void);

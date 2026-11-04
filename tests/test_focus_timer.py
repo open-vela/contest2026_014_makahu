@@ -1,8 +1,9 @@
 """Production focus timer advances while the production sync loop is blocked."""
+from host_support import PROJECT_ROOT, CC, focus_legacy_helpers
 from pathlib import Path
 import subprocess
 import tempfile
-root = Path(__file__).resolve().parents[1]
+root = PROJECT_ROOT
 main = (root/'app/buffer_app/buffer_app_main.c').read_text()
 wire = (root/'app/buffer_app/buffer_wire.c').read_text()
 def section(text, start, end):
@@ -19,6 +20,9 @@ harness = r'''
 #include <unistd.h>
 #define BUFFER_WIRE_RECONNECT_AFTER_FAILURES 3
 struct buffer_runtime_s g_buffer = {.lock = PTHREAD_MUTEX_INITIALIZER};
+static pthread_mutex_t g_service_stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int agent_stops;
+void buffer_agent_stop(void) { atomic_fetch_add(&agent_stops, 1); }
 static atomic_llong clock_ms = 100;
 static atomic_int reminders;
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
@@ -39,7 +43,11 @@ static bool buffer_wire_should_reconnect(int ret) { return ret < 0; }
 static int buffer_wire_refresh_phone_host(void) { return -ENETUNREACH; }
 int buffer_wifi_reconnect(void) { return -ENETUNREACH; }
 void buffer_request_sync(void) {}
-''' + section(main, 'static uint32_t buffer_focus_interval(', 'bool buffer_focus_snapshot(') + section(main, 'static int buffer_is_running(', 'static int buffer_start_recording(') + section(main, 'static void *buffer_timer_thread_main(', 'static void buffer_service_stop(void);') + wire[wire.index('void *buffer_wire_thread_main('):] + section(main, 'static void buffer_service_stop(void)\n{', 'static void buffer_record_for_ms(') + r'''
+static void research_tick(void) {}
+void buffer_backlight_tick(void) {}
+void buffer_backlight_shutdown(void) {}
+void buffer_source_projector_stop(void) {}
+''' + focus_legacy_helpers() + section(main, 'static uint32_t buffer_focus_interval(', 'bool buffer_focus_snapshot(') + section(main, 'static int buffer_is_running(', 'static int buffer_start_recording(') + section(main, 'static void *buffer_timer_thread_main(', 'static void buffer_service_stop(void);') + wire[wire.index('void *buffer_wire_thread_main('):] + section(main, 'static void buffer_service_stop(void)\n{', 'static void buffer_record_for_ms(') + r'''
 static void expect_state(int64_t started, bool due, int notices)
 {
   for (int i = 0; i < 100; i++)
@@ -88,6 +96,7 @@ int main(void)
       pthread_mutex_unlock(&gate);
       buffer_service_stop();
       assert(!g_buffer.initialized && !g_buffer.timer_thread_started && !g_buffer.sync_thread_started);
+      assert(atomic_load(&agent_stops) == round + 1);
     }
   puts("PASS: reminder and expiry while sync blocked, mode exit, stop/join/restart");
 }
@@ -97,5 +106,5 @@ with tempfile.TemporaryDirectory(prefix='buffer-focus-timer-') as temporary:
     (work/'nuttx').mkdir()
     (work/'nuttx/config.h').write_text('')
     (work/'test.c').write_text(harness)
-    subprocess.run(['cc','-Wall','-Wextra','-Werror','-pthread','-I',str(work),'-I',str(root/'app/buffer_app'),str(work/'test.c'),'-o',str(work/'test')],check=True)
+    subprocess.run([*CC,'-Wall','-Wextra','-Werror','-pthread','-I',str(work),'-I',str(root/'app/buffer_app'),str(work/'test.c'),'-o',str(work/'test')],check=True)
     subprocess.run([str(work/'test')],check=True,timeout=10)

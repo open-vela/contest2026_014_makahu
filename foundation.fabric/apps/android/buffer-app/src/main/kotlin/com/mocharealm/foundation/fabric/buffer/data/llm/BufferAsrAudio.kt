@@ -9,15 +9,22 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
+internal class BufferNoAudioSignalException : IllegalArgumentException("未收到有效录音信号，请检查麦克风或补充文字")
+internal class BufferInvalidAudioException(message: String) : IllegalArgumentException(message)
+internal class BufferNoTranscriptException : IllegalArgumentException("语音服务未识别到可用文字")
+
 /** Convert existing Android AAC recordings without changing the retained original. */
 internal object BufferAsrAudio {
     private const val maxPcmBytes = 4 * 1024 * 1024
+    private inline fun requireFormat(valid: Boolean, message: () -> String) {
+        if (!valid) throw BufferInvalidAudioException(message())
+    }
     fun wav(blob: File, audioFormat: String?): ByteArray {
         require(blob.isFile && blob.length() in 1..BufferConstants.maxAudioBytes.toLong()) { "录音文件无效" }
         val mime = audioFormat.orEmpty().substringBefore(';')
         if (mime in setOf("audio/wav", "audio/x-wav", "pcm16/wav")) {
             val bytes = blob.readBytes()
-            require(bytes.size >= 44 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+            requireFormat(bytes.size >= 44 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" &&
                 String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE") { "WAV 文件无效" }
             return bytes
         }
@@ -84,7 +91,7 @@ internal object BufferAsrAudio {
 
     /** Reject digital silence, not quiet speech or particular words. Originals remain queued. */
     internal fun requireAudioSignal(wav: ByteArray) {
-        require(wav.size >= 44 && String(wav, 0, 4, Charsets.US_ASCII) == "RIFF" &&
+        requireFormat(wav.size >= 44 && String(wav, 0, 4, Charsets.US_ASCII) == "RIFF" &&
             String(wav, 8, 4, Charsets.US_ASCII) == "WAVE") { "WAV 文件无效" }
         val bytes = ByteBuffer.wrap(wav).order(ByteOrder.LITTLE_ENDIAN)
         var offset = 12
@@ -93,24 +100,24 @@ internal object BufferAsrAudio {
         var signal = false
         while (offset <= wav.size - 8) {
             val size = bytes.getInt(offset + 4)
-            require(size >= 0 && size <= wav.size - offset - 8) { "WAV 数据不完整" }
+            requireFormat(size >= 0 && size <= wav.size - offset - 8) { "WAV 数据不完整" }
             val tag = String(wav, offset, 4, Charsets.US_ASCII)
             val start = offset + 8
             if (tag == "fmt ") {
-                require(size >= 16) { "WAV 格式无效" }
+                requireFormat(size >= 16) { "WAV 格式无效" }
                 pcm16 = bytes.getShort(start).toInt() == 1 && bytes.getShort(start + 14).toInt() == 16
             }
             if (tag == "data") {
                 dataFound = true
-                require(size % 2 == 0) { "WAV 样本不完整" }
+                requireFormat(size % 2 == 0) { "WAV 样本不完整" }
                 for (index in start until start + size step 2) {
                     if (kotlin.math.abs(bytes.getShort(index).toInt()) > 16) signal = true
                 }
             }
             offset = start + size + (size % 2)
         }
-        require(pcm16 && dataFound) { "需要 PCM16 WAV 录音" }
-        require(signal) { "未收到有效录音信号，请检查模拟器麦克风后重新录音" }
+        requireFormat(pcm16 && dataFound) { "需要 PCM16 WAV 录音" }
+        if (!signal) throw BufferNoAudioSignalException()
     }
 
     internal fun wrapPcm(pcm: ByteArray, rate: Int, channels: Int): ByteArray {

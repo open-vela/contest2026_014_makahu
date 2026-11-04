@@ -1,0 +1,218 @@
+diff --git a/drivers/wireless/bluetooth/bt_slip.c b/drivers/wireless/bluetooth/bt_slip.c
+--- a/drivers/wireless/bluetooth/bt_slip.c
++++ b/drivers/wireless/bluetooth/bt_slip.c
+@@ -107,6 +107,7 @@
+ {
+   enum bt_buf_type_e type;
+   size_t pktlen;
++  uint8_t seq;
+   uint8_t data[1];
+ };
+ 
+@@ -135,6 +136,9 @@
+   uint8_t txseq; /* Next seq number to send */
+   uint8_t txack; /* Next ack number to send */
+   uint8_t txwin; /* Sliding window size */
++
++  /* Protected by sliplock; do not put a full escaped frame on thread stacks. */
++  uint8_t packet[CONFIG_BLUETOOTH_SLIP_TXBUFSIZE];
+ };
+ 
+ /****************************************************************************
+@@ -332,27 +336,6 @@
+   return packet;
+ }
+ 
+-static void bt_slip_retx_work(FAR void *arg)
+-{
+-  FAR struct sliphci_s *priv = arg;
+-  FAR struct unack_frame_s *frame;
+-  size_t size;
+-
+-  if (priv->linkstate != BT_SLIP_ACTIVE)
+-    {
+-      wlerr("err: linkstate:%d not active", priv->linkstate);
+-      return;
+-    }
+-
+-  size = bt_slip_unack_size(priv);
+-  while (size > 0)
+-    {
+-      frame = (FAR struct unack_frame_s *)bt_slip_unack_dtor(priv);
+-      bt_slip_send(&priv->dev, frame->type, frame->data, frame->pktlen);
+-      size--;
+-    }
+-}
+-
+ static bool bt_slip_reliable_packet(uint8_t type)
+ {
+   switch (type)
+@@ -368,20 +351,27 @@
+ }
+ 
+ static int bt_slip_send_packet(FAR struct sliphci_s *priv, uint8_t type,
+-                               FAR const uint8_t *payload, size_t len)
+-{
+-  uint8_t packet[CONFIG_BLUETOOTH_SLIP_TXBUFSIZE];
++                               FAR const uint8_t *payload, size_t len, uint8_t seq)
++{
++  FAR uint8_t *packet = priv->packet;
+   uint8_t header[BT_SLIP_HEADER_LEN];
+   FAR uint8_t *pend;
+   uint16_t checksum = 0;
+   int index;
+ 
++  /* Every byte may need escaping, plus delimiters and optional CRC. */
++  if (len > 0xfff ||
++      len > (sizeof(priv->packet) - 2) / 2 - BT_SLIP_HEADER_LEN -
++            (priv->dipresent ? BT_SLIP_CHECKSUM_LEN : 0))
++    {
++      return -EMSGSIZE;
++    }
++
+   memset(header, 0, sizeof(header));
+   if (bt_slip_reliable_packet(type))
+     {
+       BT_SLIP_SET_RELIABLE(header);
+-      BT_SLIP_SET_SEQ(header, priv->txseq);
+-      BT_SLIP_SEQ_INCR(priv->txseq);
++      BT_SLIP_SET_SEQ(header, seq);
+     }
+ 
+   BT_SLIP_SET_ACK(header, priv->txack);
+@@ -443,13 +433,48 @@
+          BT_SLIP_GET_PKT_TYPE(header), BT_SLIP_GET_LEN(header),
+          BT_SLIP_GET_SEQ(header), BT_SLIP_GET_ACK(header), checksum);
+ 
+-  return priv->drv->send(priv->drv, type, packet, pend - packet);
++  int ret = priv->drv->send(priv->drv, type, packet, pend - packet);
++  return ret < 0 ? ret : (ret == pend - packet ? ret : -EIO);
++}
++
++static void bt_slip_retx_work(FAR void *arg)
++{
++  FAR struct sliphci_s *priv = arg;
++  FAR struct unack_pool_s *pool = &priv->unackpool;
++  FAR struct unack_frame_s *frame;
++  size_t i;
++
++  if (nxmutex_lock(&priv->sliplock) < 0)
++    {
++      return;
++    }
++
++  if (priv->linkstate == BT_SLIP_ACTIVE)
++    {
++      /* Replay in place with the original sequence.  Removing/re-enqueuing
++       * here lets the controller discard retransmissions as new packets. */
++      for (i = 0; i < pool->size; i++)
++        {
++          frame = (FAR struct unack_frame_s *)
++            pool->buf[(pool->end + i) % CONFIG_BLUETOOTH_SLIP_TXWIN];
++          bt_slip_send_packet(priv, frame->type, frame->data,
++                              frame->pktlen, frame->seq);
++        }
++
++      if (pool->size)
++        {
++          work_queue(HPWORK, &priv->retxworker, bt_slip_retx_work,
++                     priv, BT_SLIP_RTX_TIMEOUT);
++        }
++    }
++
++  nxmutex_unlock(&priv->sliplock);
+ }
+ 
+ static void bt_slip_send_link_control(FAR struct sliphci_s *priv,
+                                       FAR const void *data, size_t len)
+ {
+-  bt_slip_send_packet(priv, HCI_3WIRE_LINK_PKT, data, len);
++  bt_slip_send_packet(priv, HCI_3WIRE_LINK_PKT, data, len, 0);
+ }
+ 
+ static void bt_slip_send_ack(FAR void *arg)
+@@ -462,7 +487,7 @@
+       return;
+     }
+ 
+-  bt_slip_send_packet(priv, HCI_3WIRE_ACK_PKT, NULL, 0);
++  bt_slip_send_packet(priv, HCI_3WIRE_ACK_PKT, NULL, 0, 0);
+ }
+ 
+ static int bt_slip_link_packet_hanlde(FAR struct sliphci_s *priv,
+@@ -668,6 +693,11 @@
+       return ret;
+     }
+ 
++  priv->txseq = 0;
++  priv->txack = 0;
++  priv->rxack = 0;
++  priv->txwin = 0;
++  priv->dipresent = false;
+   bt_slip_unack_init(priv);
+   bt_slip_send_link_control(priv, g_sync_req, sizeof(g_sync_req));
+ 
+@@ -709,7 +739,13 @@
+       return ret;
+     }
+ 
+-  if (bt_slip_unack_size(priv) >= priv->txwin)
++  if (priv->linkstate != BT_SLIP_ACTIVE || priv->txwin == 0)
++    {
++      ret = -ENOTCONN;
++      goto end;
++    }
++
++  while (bt_slip_unack_size(priv) >= priv->txwin)
+     {
+       bt_slip_send_ack(priv);
+ 
+@@ -738,14 +774,23 @@
+       goto end;
+     }
+ 
+-  ret = bt_slip_send_packet(priv, var, data, len);
++  if (len > CONFIG_BLUETOOTH_SLIP_TXBUFSIZE -
++            offsetof(struct unack_frame_s, data))
++    {
++      ret = -EMSGSIZE;
++      goto end;
++    }
++
++  ret = bt_slip_send_packet(priv, var, data, len, priv->txseq);
+   if (ret < 0)
+     {
+       goto end;
+     }
+ 
+   frame = (FAR struct unack_frame_s *)bt_slip_unack_ctor(priv);
+-  frame->type = type;
++  frame->type = var;
++  frame->seq = priv->txseq;
++  BT_SLIP_SEQ_INCR(priv->txseq);
+   frame->pktlen = len;
+   memcpy(frame->data, data, len);
+ 
+@@ -853,6 +898,7 @@
+               {
+                 wlerr("err: out of order packet arrived(%u != %u)",
+                        BT_SLIP_GET_SEQ(header), priv->txack);
++                bt_slip_send_ack(priv);
+                 state = PACKET_START;
+                 break;
+               }
+@@ -1009,9 +1055,12 @@
+   priv = (FAR struct sliphci_s *)dev;
+   drv = priv->drv;
+ 
++  nxmutex_lock(&priv->sliplock);
++  priv->linkstate = BT_SLIP_UNINITIALIZED;
++  work_cancel(HPWORK, &priv->retxworker);
++  bt_slip_unack_cleanup(priv);
++  nxmutex_unlock(&priv->sliplock);
+   drv->close(drv);
+-  priv->linkstate = BT_SLIP_UNINITIALIZED;
+-  bt_slip_unack_cleanup(priv);
+ }
+ 
+ /****************************************************************************

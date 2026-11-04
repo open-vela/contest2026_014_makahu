@@ -1,0 +1,54 @@
+diff --git a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_fill.c b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_fill.c
+--- a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_fill.c
++++ b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d_fill.c
+@@ -66,7 +66,7 @@
+         return; /*Fully clipped, nothing to do*/
+ 
+     uint8_t * dest_buf = layer->draw_buf->data;
+-    uint32_t dest_stride = lv_draw_buf_width_to_stride(lv_area_get_width(&layer->buf_area), layer->color_format);
++    uint32_t dest_stride = layer->draw_buf->header.stride;
+     lv_color_format_t dest_cf = layer->color_format;
+     lv_area_t buf_area = layer->buf_area;
+     _g2d_fill(dest_buf, &blend_area, dest_stride, &buf_area, dest_cf, dsc);
+@@ -83,10 +83,10 @@
+     int32_t dest_h = lv_area_get_height(dest_area);
+ 
+     uint8_t px_size = lv_color_format_get_size(dest_cf);
+-    if(px_size == 0)
++    if(px_size == 0 || dest_w <= 0 || dest_h <= 0)
+         return;
+     unsigned long vaddr_start = (unsigned long)dest_buf + dest_stride * dest_area->y1 + px_size * dest_area->x1;
+-    hal_dcache_clean_invalidate(vaddr_start, dest_stride * dest_h);
++    hal_dcache_clean_invalidate(vaddr_start, (dest_h - 1) * dest_stride + dest_w * px_size);
+ 
+     g2d_fillrect_h info;
+     lv_memset(&info, 0, sizeof(g2d_fillrect_h));
+@@ -99,8 +99,9 @@
+     }
+ 
+     info.dst_image_h.mode = G2D_PIXEL_ALPHA;
+-    info.dst_image_h.color = (lv_color_to_u32(dsc->color) & (~(0xff << 24))) | (dsc->opa << 24);
+-    info.dst_image_h.format = 0;
++    info.dst_image_h.color = (lv_color_to_u32(dsc->color) & 0x00ffffffu) | ((uint32_t)dsc->opa << 24);
++    /* RGB565 destinations must never be described as 32-bit ARGB. */
++    info.dst_image_h.format = g2d_get_px_format(dest_cf);
+     info.dst_image_h.clip_rect.x = 0;
+     info.dst_image_h.clip_rect.y = 0;
+     info.dst_image_h.clip_rect.w = dest_w;
+diff --git a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c
+--- a/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c
++++ b/graphics/lvgl/lvgl/src/draw/sunxi_g2d/lv_draw_g2d.c
+@@ -165,6 +165,13 @@
+         case LV_DRAW_TASK_TYPE_FILL: {
+                 const lv_draw_fill_dsc_t * draw_dsc = (lv_draw_fill_dsc_t *) t->draw_dsc;
+                 if(size == 0) return 0;
++                /* FILLRECT replaces pixels; translucent rectangles require
++                 * blending with the existing destination, handled by SW. */
++                if(draw_dsc->opa < LV_OPA_MAX) return 0;
++                if(!draw_dsc->base.layer) return 0;
++                lv_color_format_t cf = draw_dsc->base.layer->color_format;
++                if(cf != LV_COLOR_FORMAT_RGB565 && cf != LV_COLOR_FORMAT_RGB888 &&
++                   cf != LV_COLOR_FORMAT_ARGB8888 && cf != LV_COLOR_FORMAT_XRGB8888) return 0;
+ 
+                 /* Most simple case: just a plain rectangle (no radius, no gradient). */
+                 if((draw_dsc->radius != 0) || (draw_dsc->grad.dir != (lv_grad_dir_t)LV_GRAD_DIR_NONE))
